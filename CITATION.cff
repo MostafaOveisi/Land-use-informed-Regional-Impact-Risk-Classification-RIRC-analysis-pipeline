@@ -1,0 +1,23 @@
+
+cff-version: 1.2.0
+message: "If you use this software pipeline in your research, please cite it using the metadata below."
+title: "Land-use-informed Regional Impact Risk Classification (RIRC) analysis pipeline"
+version: "v1.0"
+doi: "10.5281/zenodo.23235356"
+date-released: 2026-10-26
+url: "https://github.com/MostafaOveisi/Land-use-informed-Regional-Impact-Risk-Classification-RIRC-analysis-pipeline"
+authors:
+  - family-names: "Oveisi"
+    given-names: "Mostafa"
+    affiliation: "University of Tehran"
+  - family-names: "Maggini"
+    given-names: "Ramona"
+    affiliation: "Agroscope"
+keywords:
+  - "invasive plant ecology"
+  - "species distribution modeling"
+  - "ecological risk assessment"
+  - "EICAT"
+  - "SEICAT"
+  - "Sorghum halepense"
+license: "GPL-3.0"
