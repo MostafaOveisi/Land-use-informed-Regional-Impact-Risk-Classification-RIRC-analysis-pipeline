@@ -1,0 +1,2 @@
+# Land-use-informed-Regional-Impact-Risk-Classification-RIRC-analysis-pipeline
+The RIRC framework combines a hierarchical species distribution model, with a nested regional model using high-resolution land use data, and a LU/LC-based (S)EICAT impact assessment. It maps impact risk by ecological and socio-economic mechanism at fine regional scale. We applied it to Sorghum halepense in Switzerland; the R script is transferable.
