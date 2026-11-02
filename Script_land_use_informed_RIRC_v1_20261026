@@ -1,0 +1,2494 @@
+###############################################################################
+# 
+# Reproducible R workflow for land-use-informed RIRC
+#
+# Manuscript:
+#   Modelling regional impact risk combining land-use-informed habitat suitability
+#   and potential impact assessment: Case study of Sorghum halepense in Switzerland
+
+# Journal: Ecological Informatics
+#
+# Supplementary Material - Script S1 v1.0
+#
+# Corresponding authors:
+#   Mostafa Oveisi   <moveisi@ut.ac.ir>
+#   Ramona Maggini   <ramona.maggini@agroscope.admin.ch>
+#
+# Description:
+#   land-use-informed RIRC analysis pipeline.
+#   Generalized for any species and study area. Edit the CONFIG block only.
+#   Default values follow the Sorghum halepense / Switzerland case study.
+#
+# License: 
+#   GNU General Public License (GPL >= 3) 
+#
+###############################################################################
+
+
+###############################################################################
+
+###############################################################################
+# 0. USER CONFIGURATION
+###############################################################################
+
+
+
+cfg <- list(
+  # ---------------------------------------------------------------------------
+  # Project identity
+  # ---------------------------------------------------------------------------
+  project_name    = "project_name",
+  species_name    = "species_name",
+  study_area_name = "study_area",
+  
+  # ---------------------------------------------------------------------------
+  # Main run flags
+  # ---------------------------------------------------------------------------
+  run_global_sdm   = TRUE,
+  run_local_sdm    = TRUE,
+  run_export       = TRUE,
+  run_rirc         = TRUE,
+  run_rirc_module  = TRUE,
+  
+  # ---------------------------------------------------------------------------
+  # Random seeds
+  # ---------------------------------------------------------------------------
+  seed_global = 42L,
+  seed_local  = 123L,
+  
+  # ---------------------------------------------------------------------------
+  # Paths (ALL as character file/folder paths)
+  # ---------------------------------------------------------------------------
+  # Paths
+  project_root      = "C:/R/Projects/project_root",
+  occurrence_file   = "C:/R/Projects/project_root/inputs/occurrences.csv",
+  occurrence_file_regional = "C:/R/Projects/project_root/inputs/regional_occurrences.csv",
+  boundary_file     = "C:/R/Projects/project_root/inputs/boundary.shp",
+  global_pred_dir   = "C:/R/Projects/project_root/inputs/climate",
+  regional_landuse_file = "C:/R/Projects/project_root/inputs/landuse.tif",
+  coarse_suit_file   = "C:/R/Projects/project_root/outputs/global_suitability.tif",
+  output_root        = "C:/R/Projects/project_root/outputs",
+  # ---------------------------------------------------------------------------
+  # Study area / CRS
+  # ---------------------------------------------------------------------------
+  occurrence_crs    = "EPSG:4326", # WGS 84 (World Geodetic System 1984)
+  global_crs        = "ESRI:54009", # World_Mollweide projected coordinate system (Equal-Area)
+  export_crs        = "EPSG:2056", # Swiss coordinate reference system CH1903+ / LV95
+  regional_target_crs  = "EPSG:2056", #Swiss coordinate reference system CH1903+ / LV95
+  
+  # ---------------------------------------------------------------------------
+  # Occurrence cleaning
+  # ---------------------------------------------------------------------------
+  year_min                 = 1950,
+  max_coord_uncertainty_m  = 1000,
+  min_records              = 50,
+  
+  # ---------------------------------------------------------------------------
+  # Global SDM settings
+  # ---------------------------------------------------------------------------
+  accessible_buffer_m = 100000,
+  background_res_m    = 1000,
+  bias_smoothing_m    = 200000,
+  bias_agg_factor     = 2L,
+  n_blocks            = 5,
+  block_sizes_m       = c(75000, 100000, 125000),
+  block_size_m        =	75000,		
+  cor_threshold       = 0.8,
+  vif_threshold       = 10,
+  rf_grid_mtry        = 2:6,
+  rf_grid_min_node    = c(1, 3, 5, 10),
+  rf_grid_sample_frac = c(0.5, 0.632, 0.8),
+  
+  # ---------------------------------------------------------------------------
+  # Regional SDM settings
+  # ---------------------------------------------------------------------------
+  regional_vif_run       = TRUE,
+  regional_vif_threshold = 10,
+  regional_block_sizes_m = c(1000, 2000, 3000, 5000, 7500, 10000),
+  regional_block_size_m  = 5000,
+  regional_bg_buffer_m   = c(500, 1000, 2000),
+  regional_bg_reps       = 5,
+  regional_ref_dummy     = NA_character_,
+  
+  # ---------------------------------------------------------------------------
+  # Optional threshold/classification settings
+  # ---------------------------------------------------------------------------
+  tss_threshold = 0.4,
+  
+  # ---------------------------------------------------------------------------
+  # Output options
+  # ---------------------------------------------------------------------------
+  map_width  = 12,
+  map_height = 9,
+  map_dpi    = 600
+)
+
+
+###############################################################################
+# 1. PACKAGES
+###############################################################################
+
+required_pkgs <- c(
+  "terra", "sf", "dplyr", "tidyr", "purrr", "stringr", "janitor", "tibble",
+  "readr", "pROC", "ranger", "blockCV", "ggplot2", "scales", "caret", "stars",
+  "ragg", "openxlsx", "ggspatial", "grid"
+)
+
+
+suppressPackageStartupMessages({
+  library(terra)
+  library(sf)
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(stringr)
+  library(janitor)
+  library(tibble)
+  library(readr)
+  library(pROC)
+  library(ranger)
+  library(blockCV)
+  library(ggplot2)
+  library(scales)
+  library(caret)
+  library(stars)
+  library(openxlsx)
+  library(ggspatial)
+  library(grid)
+  library(devtools)
+})
+
+###############################################################################
+# 2. OUTPUT DIRECTORIES
+###############################################################################
+
+out_dir    <- cfg$output_root
+ras_dir    <- file.path(out_dir, "rasters")
+maps_dir   <- file.path(out_dir, "maps")
+tables_dir <- file.path(out_dir, "tables")
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(ras_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(maps_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(tables_dir, recursive = TRUE, showWarnings = FALSE)
+
+###############################################################################
+# 3. HELPER FUNCTIONS
+###############################################################################
+
+detect_lon_lat <- function(nms) {
+  nms_low <- tolower(nms)
+  lon_candidates <- which(nms_low %in% c("longitude", "lon", "long", "x", "decimal_longitude"))
+  lat_candidates <- which(nms_low %in% c("latitude", "lat", "y", "decimal_latitude"))
+  list(lon = lon_candidates[1], lat = lat_candidates[1])
+}
+
+extract_year <- function(x) {
+  y <- suppressWarnings(as.integer(substr(as.character(x), 1, 4)))
+  y[!is.finite(y)] <- NA_integer_
+  y
+}
+
+extract_uncertainty_m <- function(x) {
+  u <- suppressWarnings(as.numeric(gsub("[^0-9.]", "", as.character(x))))
+  u[!is.finite(u)] <- NA_real_
+  u
+}
+
+standardize_bio_names <- function(x) {
+  x <- tolower(x)
+  x <- gsub("[^a-z0-9]+", "", x)
+  x <- gsub("^bio0*", "bio", x)
+  x
+}
+
+calc_binary_metrics <- function(obs, prob, thr) {
+  keep <-complete.cases(obs, prob)
+  obs <- obs[keep]
+  prob <- prob[keep]
+  
+  pred <- ifelse(prob >= thr, 1, 0)
+  
+  tp <- sum(obs == 1 & pred == 1)
+  tn <- sum(obs == 0 & pred == 0)
+  fp <- sum(obs == 0 & pred == 1)
+  fn <- sum(obs == 1 & pred == 0)
+  
+  sens <- ifelse((tp + fn) > 0, tp / (tp + fn), NA_real_)
+  spec <- ifelse((tn + fp) > 0, tn / (tn + fp), NA_real_)
+  tss  <- sens + spec - 1
+  acc  <- ifelse(sum(!is.na(obs)) > 0, mean(pred == obs, na.rm = TRUE), NA_real_) #for binary 0/1 data, this is mathematically equivalent to: (tp + tn) / (tp + tn + fp + fn)
+  
+  data.frame(
+    threshold = thr,
+    sensitivity = sens,
+    specificity = spec,
+    TSS = tss,
+    accuracy = acc
+  )
+}
+
+calc_auc <- function(obs, prob) {
+  if (length(unique(obs)) < 2) return(NA_real_)
+  as.numeric(pROC::auc(pROC::roc(obs, prob, quiet = TRUE)))
+}
+
+calc_optimal_threshold <- function(truth, prob, method = c("youden", "closest_topleft")) {
+  method <- match.arg(method)
+  
+  # --- internal safe numeric coercion ---
+  to_num <- function(x) {
+    if (is.data.frame(x)) {
+      if (ncol(x) != 1) stop("Input data.frame must have exactly 1 column.")
+      x <- x[[1]]
+    }
+    if (is.list(x)) x <- unlist(x, recursive = TRUE, use.names = FALSE)
+    if (is.factor(x)) x <- as.character(x)
+    if (is.logical(x)) x <- as.integer(x)
+    suppressWarnings(as.numeric(x))
+  }
+  
+  y <- to_num(truth)
+  p <- to_num(prob)
+  
+  ok <- is.finite(y) & is.finite(p)
+  y <- y[ok]; p <- p[ok]
+  
+  if (length(y) == 0) stop("calc_optimal_threshold: no valid rows.")
+  if (!all(y %in% c(0, 1))) stop("calc_optimal_threshold: truth must be binary 0/1.")
+  
+  n_pos <- sum(y == 1); n_neg <- sum(y == 0)
+  if (n_pos == 0 || n_neg == 0) {
+    warning("Only one class present.")
+    return(NA_real_)
+  }
+  
+  thr <- sort(unique(p))
+  if (length(thr) == 1) return(as.numeric(thr))
+  
+  sens <- numeric(length(thr))
+  spec <- numeric(length(thr))
+  
+  for (i in seq_along(thr)) {
+    t <- thr[i]
+    pred_pos <- p >= t
+    
+    tp <- sum(pred_pos & y == 1)
+    fn <- sum(!pred_pos & y == 1)
+    tn <- sum(!pred_pos & y == 0)
+    fp <- sum(pred_pos & y == 0)
+    
+    sens[i] <- tp / (tp + fn)
+    spec[i] <- tn / (tn + fp)
+  }
+  
+  if (method == "youden") {
+    score <- sens + spec - 1
+    best <- which.max(score)
+    best_idx <- which(score == score[best])
+  } else {
+    fpr <- 1 - spec
+    d <- sqrt((fpr - 0)^2 + (sens - 1)^2)
+    best <- which.min(d)
+    best_idx <- which(d == d[best])
+  }
+  
+  as.numeric(stats::median(thr[best_idx]))
+}
+
+
+get_ranger_prob <- function(model, newdata) {
+  p <- predict(model, data = newdata)$predictions
+  if (is.matrix(p)) {
+    if ("1" %in% colnames(p)) return(as.numeric(p[, "1"]))
+    return(as.numeric(p[, ncol(p)]))
+  }
+  as.numeric(p)
+}
+
+calc_vif <- function(df, threshold = 10) {
+  if (ncol(df) < 2) return(list(data = df, excluded = character(0), vif = NULL))
+  vif_res <- tryCatch(usdm::vif(df), error = function(e) NULL)
+  if (is.null(vif_res)) return(list(data = df, excluded = character(0), vif = NULL))
+  vif_df <- vif_res@results
+  excluded <- character(0)
+  while (nrow(vif_df) > 0 && max(vif_df$VIF, na.rm = TRUE) > threshold && ncol(df) > 2) {
+    drop_var <- vif_df$Variables[which.max(vif_df$VIF)]
+    excluded <- c(excluded, drop_var)
+    df <- df[, setdiff(names(df), drop_var), drop = FALSE]
+    vif_res <- tryCatch(usdm::vif(df), error = function(e) NULL)
+    if (is.null(vif_res)) break
+    vif_df <- vif_res@results
+  }
+  list(data = df, excluded = unique(excluded), vif = vif_df)
+}
+
+make_bias_surface <- function(pts, template_rast, smooth_m = 200000, agg_factor = 2L) {
+  cells <- terra::extract(template_rast, pts, cells = TRUE)
+  pres_cells <- unique(cells[, 2])
+  bias <- terra::rast(template_rast)
+  terra::values(bias) <- 0
+  bias[pres_cells] <- 1
+  bias <- terra::focal(
+    bias,
+    w = matrix(1, 5, 5),
+    fun = mean,
+    na.policy = "omit",
+    fillvalue = 0
+  )
+  bias <- terra::aggregate(bias, fact = agg_factor, fun = mean, na.rm = TRUE)
+  bias <- terra::disagg(bias, fact = agg_factor, method = "bilinear")
+  bias <- terra::resample(bias, template_rast, method = "bilinear")
+  bias <- terra::focal(
+    bias,
+    w = matrix(1, 7, 7),
+    fun = mean,
+    na.policy = "omit",
+    fillvalue = 0
+  )
+  bias <- bias / max(terra::values(bias), na.rm = TRUE)
+  bias[is.na(bias)] <- 0
+  bias
+}
+
+ensure_same_geometry <- function(r1, r2) {
+  if (!terra::compareGeom(r1, r2, stopOnError = FALSE)) {
+    stop("Rasters do not share the same geometry/alignment.")
+  }
+  TRUE
+}
+
+prepare_for_excel <- function(x) {
+  if (inherits(x, "sf")) x <- sf::st_drop_geometry(x)
+  if (inherits(x, "SpatVector")) x <- as.data.frame(x, geom = FALSE)
+  if (is.matrix(x) || inherits(x, "table")) x <- as.data.frame(x)
+  if (is.atomic(x) && is.null(dim(x))) x <- data.frame(value = x)
+  
+  if (!is.data.frame(x)) {
+    x <- tryCatch(as.data.frame(x), error = function(e) {
+      stop("Could not convert object to data.frame: ", conditionMessage(e))
+    })
+  }
+  
+  list_columns <- vapply(x, is.list, logical(1))
+  if (any(list_columns)) {
+    x[list_columns] <- lapply(x[list_columns], function(column) {
+      vapply(column, function(element) {
+        if (is.null(element) || length(element) == 0L) return(NA_character_)
+        paste(as.character(element), collapse = "; ")
+      }, character(1))
+    })
+  }
+  
+  posixlt_columns <- vapply(x, inherits, logical(1), what = "POSIXlt")
+  if (any(posixlt_columns)) {
+    x[posixlt_columns] <- lapply(x[posixlt_columns], as.POSIXct)
+  }
+  
+  excel_max_rows <- 1048576L
+  if (nrow(x) + 1L > excel_max_rows) {
+    stop("A table exceeds the Excel row limit.")
+  }
+  
+  x
+}
+
+add_existing_object <- function(result_list, object_name, sheet_name = object_name) {
+  if (exists(object_name, inherits = TRUE)) {
+    object_value <- get(object_name, inherits = TRUE)
+    if (!is.null(object_value)) {
+      result_list[[sheet_name]] <- prepare_for_excel(object_value)
+    }
+  }
+  result_list
+}
+
+safe_value <- function(object_name, default = NA) {
+  if (!exists(object_name, inherits = TRUE)) return(default)
+  value <- get(object_name, inherits = TRUE)
+  if (is.null(value) || length(value) == 0L) return(default)
+  value[1]
+}
+
+safe_table_value <- function(object_name, column_name, default = NA_real_) {
+  if (!exists(object_name, inherits = TRUE)) return(default)
+  object_value <- get(object_name, inherits = TRUE)
+  if (
+    is.null(object_value) ||
+    !is.data.frame(object_value) ||
+    nrow(object_value) == 0L ||
+    !column_name %in% names(object_value)
+  ) {
+    return(default)
+  }
+  object_value[[column_name]][1]
+}
+
+sanitize_name <- function(x) {
+  x <- tolower(x)
+  x <- gsub("[^a-z0-9]+", "_", x)
+  x <- gsub("^_|_$", "", x)
+  x
+}
+
+pretty_title <- function(x) {
+  x <- gsub("[_.]+", " ", x)
+  tools::toTitleCase(x)
+}
+
+###############################################################################
+# 4. GLOBAL SDM MODULE
+###############################################################################
+
+if (isTRUE(cfg$run_global_sdm)) {
+  
+  message("Running global SDM module...")
+  
+  set.seed(cfg$seed_global)
+  
+  #############################################################################
+  # 4.1 Read and clean occurrence data
+  #############################################################################
+  
+  # glo_ prefix stands for "global"
+  
+  glo_occ_raw <- readr::read_delim(
+    cfg$occurrence_file,
+    delim = "\t",   # GBIF standard
+    locale = readr::locale(encoding = "UTF-8"),
+    show_col_types = FALSE,
+    guess_max = 100000
+  ) %>%
+    janitor::clean_names()
+  
+  n_row_glo_occ <- nrow(glo_occ_raw)
+  
+  lonlat <- detect_lon_lat(names(glo_occ_raw))
+  if (is.na(lonlat$lon) || is.na(lonlat$lat)) {
+    stop("Could not detect longitude/latitude columns in the occurrence file.")
+  }
+  
+  glo_occ_dat <- glo_occ_raw %>%
+    mutate(
+      lon = as.numeric(.data[[names(glo_occ_raw)[lonlat$lon]]]),
+      lat = as.numeric(.data[[names(glo_occ_raw)[lonlat$lat]]])
+    )
+  
+  if ("year" %in% names(glo_occ_dat)) {
+    glo_occ_dat$year_num <- extract_year(glo_occ_dat$year)
+  } else {
+    glo_occ_dat$year_num <- NA_integer_
+  }
+  
+  if ("coordinate_uncertainty_in_meters" %in% names(glo_occ_dat)) {
+    glo_occ_dat$uncertainty_m <- extract_uncertainty_m(glo_occ_dat$coordinate_uncertainty_in_meters)
+  } else if ("coordinate_uncertainty" %in% names(glo_occ_dat)) {
+    glo_occ_dat$uncertainty_m <- extract_uncertainty_m(glo_occ_dat$coordinate_uncertainty)
+  } else {
+    glo_occ_dat$uncertainty_m <- NA_real_
+  }
+  
+  glo_occ_clean <- glo_occ_dat %>%
+    filter(
+      is.finite(lon), is.finite(lat),
+      lon >= -180, lon <= 180,
+      lat >= -90, lat <= 90
+    ) %>%
+    filter(is.na(year_num) | year_num >= cfg$year_min) %>%
+    filter(is.na(uncertainty_m) | uncertainty_m <= cfg$max_coord_uncertainty_m) %>%
+    distinct(lon, lat, .keep_all = TRUE)
+  
+  n_clean_glo_occ <- nrow(glo_occ_clean)
+  
+  if (n_clean_glo_occ < cfg$min_records) {
+    stop("Too few cleaned occurrence records remain after filtering.")
+  }
+  
+  glo_occ_sf <- sf::st_as_sf(
+    glo_occ_clean,
+    coords = c("lon", "lat"),
+    crs = cfg$occurrence_crs,
+    remove = FALSE
+  )
+  
+  #############################################################################
+  # 4.2 Read and prepare predictors
+  #############################################################################
+  
+  glo_pred_files <- list.files(
+    cfg$global_pred_dir,
+    pattern = "\\.tif(f)?$",
+    full.names = TRUE,
+    recursive = TRUE
+  )
+  
+  if (length(glo_pred_files) == 0L) stop("No predictor rasters found in global_pred_dir.")
+  
+  glo_pred_stack <- terra::rast(glo_pred_files)
+  
+  names(glo_pred_stack) <- standardize_bio_names(names(glo_pred_stack))
+  names(glo_pred_stack) <- make.unique(names(glo_pred_stack))
+  names(glo_pred_stack) <- c("bio01", "bio02", "bio03", "bio04", "bio05", "bio06", "bio07", "bio08", "bio09", "bio10", "bio11", "bio12", "bio13", "bio14", "bio15", "bio16", "bio17", "bio18", "bio19")
+  
+  glo_occ_v <- terra::vect(glo_occ_sf)
+  glo_occ_values <- terra::extract(glo_pred_stack, glo_occ_v)
+  glo_occ_complete <- glo_occ_clean[complete.cases(glo_occ_values[, -1]), ]
+  glo_occ_sf <- sf::st_as_sf(glo_occ_complete, coords = c("lon", "lat"), crs = cfg$occurrence_crs, remove = FALSE)
+  
+  glo_occ_v <- terra::vect(glo_occ_sf)
+  
+  #############################################################################
+  # 4.3 Thinning to one occurrence per predictor raster pixel
+  #############################################################################
+  
+  glo_occ_xy <- terra::crds(glo_occ_v)
+  glo_occ_cell_df <- data.frame(
+    cell = terra::cellFromXY(glo_pred_stack, glo_occ_xy)
+  )
+  glo_occ_complete$cell_id <- glo_occ_cell_df$cell
+  glo_occ_thin <- glo_occ_complete %>%
+    group_by(cell_id) %>%
+    slice(1) %>%
+    ungroup()
+  
+  glo_occ_sf_thin <- sf::st_as_sf(
+    glo_occ_thin,
+    coords = c("lon", "lat"),
+    crs = cfg$occurrence_crs,
+    remove = FALSE
+  )
+  
+  n_row_glo_final_pres <- nrow(glo_occ_sf_thin)
+  
+  #############################################################################
+  # 4.4 Background sampling
+  #############################################################################
+  
+  glo_pres_proj <- sf::st_transform(glo_occ_sf_thin, cfg$global_crs)
+  glo_pres_v_proj <- terra::vect(glo_pres_proj)
+  
+  glo_pred_proj <- terra::project(glo_pred_stack, cfg$global_crs, method = "bilinear")
+  template_global <- terra::rast(glo_pred_proj[[1]])
+  glo_aoi <- terra::buffer(glo_pres_v_proj, width = cfg$accessible_buffer_m)
+  glo_aoi_r <- terra::rasterize(glo_aoi, template_global, field = 1, background = NA)
+  
+  # current pixel resolution (x and y)
+  r0 <- terra::res(template_global)
+  
+  # factor to refine/coarsen (assumes square target res)
+  fact <- r0[1] / cfg$background_res_m
+  
+  if (fact > 1) {
+    # finer grid
+    glo_bg_grid <- terra::disagg(template_global, fact = round(fact), method = "")
+  } else if (fact < 1) {
+    # coarser grid
+    glo_bg_grid <- terra::aggregate(template_global, fact = round(1/fact), fun = "mean")
+  } else {
+    glo_bg_grid <- template_global
+  }
+  
+  values(glo_bg_grid) <- 1
+  glo_bg_grid <- terra::mask(glo_bg_grid, glo_aoi_r)
+  
+  glo_bias_surface <- make_bias_surface(
+    pts = glo_pres_v_proj,
+    template_rast = glo_bg_grid,
+    smooth_m = cfg$bias_smoothing_m,
+    agg_factor = cfg$bias_agg_factor
+  )
+  
+  glo_bg_cells <- which(!is.na(terra::values(glo_bg_grid)))
+  glo_pres_cells_bg <- unique(terra::cellFromXY(glo_bg_grid, terra::crds(glo_pres_v_proj)))
+  glo_bg_cells <- setdiff(glo_bg_cells, glo_pres_cells_bg)
+  
+  if (length(glo_bg_cells) < n_row_glo_final_pres) stop("Not enough background cells available.")
+  
+  glo_bias_vals <- terra::values(glo_bias_surface)[glo_bg_cells]
+  glo_bias_vals[is.na(glo_bias_vals)] <- 0
+  if (sum(glo_bias_vals) <= 0) {
+    glo_bias_vals <- rep(1, length(glo_bg_cells))
+  }
+  glo_bias_probs <- glo_bias_vals / sum(glo_bias_vals)
+  
+  glo_sampled_bg_cells <- sample(glo_bg_cells, size = n_row_glo_final_pres, replace = FALSE, prob = glo_bias_probs)
+  glo_bg_xy <- terra::xyFromCell(glo_bg_grid, glo_sampled_bg_cells)
+  glo_bg_sf_proj <- sf::st_as_sf(
+    data.frame(lon = glo_bg_xy[,1], lat = glo_bg_xy[,2]),
+    coords = c("lon", "lat"),
+    crs = cfg$global_crs,
+    remove = FALSE
+  )
+  glo_bg_sf <- sf::st_transform(glo_bg_sf_proj, cfg$occurrence_crs)
+  glo_bg_sf$presence <- 0
+  
+  glo_pres_sf <- glo_occ_sf_thin
+  glo_pres_sf$presence <- 1
+  
+  #############################################################################
+  # 4.5 Build modeling data
+  #############################################################################
+  
+  glo_pres_vals <- terra::extract(glo_pred_stack, terra::vect(glo_pres_sf))
+  glo_bg_vals   <- terra::extract(glo_pred_stack, terra::vect(glo_bg_sf))
+  
+  glo_pres_vals <- glo_pres_vals[, -1, drop = FALSE]
+  glo_bg_vals   <- glo_bg_vals[, -1, drop = FALSE]
+  
+  colnames(glo_pres_vals) <- names(glo_pred_stack)
+  colnames(glo_bg_vals) <- names(glo_pred_stack)
+  
+  glo_pres_df <- cbind(data.frame(presence = 1), glo_pres_vals)
+  glo_bg_df   <- cbind(data.frame(presence = 0), glo_bg_vals)
+  
+  glo_full_data_model <- bind_rows(glo_pres_df, glo_bg_df) %>%
+    drop_na()
+  
+  if (nrow(glo_full_data_model) < 30) stop("Not enough modeling records after extraction.")
+  
+  glo_predictor_names <- setdiff(names(glo_full_data_model), "presence")
+  
+  #############################################################################
+  # 4.6 Correlation and VIF screening
+  #############################################################################
+  
+  # Candidate predictors
+  glo_pred_df <- as.data.frame(glo_full_data_model[, glo_predictor_names, drop = FALSE])
+  
+  # Keep numeric only
+  glo_pred_df <- glo_pred_df[, vapply(glo_pred_df, is.numeric, logical(1)), drop = FALSE]
+  
+  if (ncol(glo_pred_df) < 2) {
+    warning("Fewer than 2 numeric predictors available; skipping correlation/VIF.")
+    final_predictors <- colnames(glo_pred_df)
+    
+  } else {
+    # --- Correlation filter ---
+    cor_mat <- stats::cor(glo_pred_df, method = "spearman", use = "pairwise.complete.obs")
+    cor_drop <- if (ncol(cor_mat) > 1) {
+      caret::findCorrelation(abs(cor_mat), cutoff = cfg$cor_threshold, names = TRUE, exact = TRUE)
+    } else character(0)
+    
+    screened_predictors <- setdiff(colnames(glo_pred_df), cor_drop)
+    if (length(screened_predictors) < 2) {
+      warning("Correlation filter left <2 predictors; reverting to numeric predictors.")
+      screened_predictors <- colnames(glo_pred_df)
+    }
+    
+    # --- VIF filter ---
+    xdat <- stats::na.omit(glo_pred_df[, screened_predictors, drop = FALSE])
+    
+    if (ncol(xdat) < 2 || nrow(xdat) < 5) {
+      warning("Insufficient complete data for VIF; using correlation-screened predictors.")
+      final_predictors <- screened_predictors
+      
+    } else {
+      v <- usdm::vifstep(xdat, th = cfg$vif_threshold)
+      
+      # safest universal rule for usdm::vifstep object:
+      # selected vars = original cols - excluded
+      excluded <- tryCatch({
+        if (isS4(v) && "excluded" %in% methods::slotNames(v)) methods::slot(v, "excluded")
+        else if (is.list(v) && "excluded" %in% names(v)) v$excluded
+        else NULL
+      }, error = function(e) NULL)
+      
+      if (!is.null(excluded)) {
+        final_predictors <- setdiff(colnames(xdat), as.character(excluded))
+      } else {
+        # fallback: parse results table if available
+        rr <- tryCatch({
+          if (isS4(v) && "results" %in% methods::slotNames(v)) methods::slot(v, "results")
+          else if (is.list(v) && "results" %in% names(v)) v$results
+          else if (is.data.frame(v)) v
+          else NULL
+        }, error = function(e) NULL)
+        
+        if (is.data.frame(rr)) {
+          nm_col <- intersect(c("Variables", "variables", "Variable", "var"), names(rr))
+          final_predictors <- if (length(nm_col) == 1) as.character(rr[[nm_col]]) else screened_predictors
+        } else {
+          final_predictors <- screened_predictors
+        }
+      }
+      
+      final_predictors <- unique(intersect(final_predictors, colnames(xdat)))
+      if (length(final_predictors) < 2) {
+        warning("VIF extraction failed/too strict; using correlation-screened predictors.")
+        final_predictors <- screened_predictors
+      }
+    }
+  }
+    
+  #############################################################################
+  # 4.7 Spatial blocks and model tuning
+  #############################################################################
+  
+  cv_pts <- rbind(
+    sf::st_as_sf(data.frame(presence = 1L), geometry = sf::st_geometry(glo_pres_sf)),
+    sf::st_as_sf(data.frame(presence = 0L), geometry = sf::st_geometry(glo_bg_sf))
+  )
+  sf::st_crs(cv_pts) <- sf::st_crs(glo_pres_sf)
+  
+  # Extract predictors for exact row sync
+  cv_ext <- terra::extract(glo_pred_stack, terra::vect(cv_pts))
+  cv_ext <- as.data.frame(cv_ext)[, -1, drop = FALSE]
+  cv_dat <- cbind(sf::st_drop_geometry(cv_pts), cv_ext)
+  cv_dat <- cv_dat[, c("presence", final_predictors), drop = FALSE]
+  
+  cc_cv <- stats::complete.cases(cv_dat)
+  cv_dat <- cv_dat[cc_cv, , drop = FALSE]
+  cv_pts <- cv_pts[cc_cv, , drop = FALSE]
+  cv_pts$.row_id <- seq_len(nrow(cv_pts))
+  cv_pts$presence <- cv_dat$presence
+  
+  
+  # Storage objects
+  
+  cv_results <- list()
+  
+  block_checks_df <- data.frame(
+    block_size = cfg$block_sizes_m,
+    AUC_mean   = NA_real_,
+    TSS_mean   = NA_real_
+  )
+  
+  best_block_size <- cfg$block_size_m
+  
+  # Block-size tuning loop
+  
+  for (bs in cfg$block_sizes_m) {
+    
+    message("Evaluating block size: ", bs, " m")
+    
+    cv_obj <- tryCatch(
+      
+      blockCV::cv_spatial(
+        x = cv_pts,
+        column = "presence",
+        size = bs,
+        k = cfg$n_blocks,
+        selection = "random",
+        iteration = 100,
+        hexagon = FALSE,
+        plot = FALSE,
+        progress = FALSE
+      ),
+      
+      error = function(e) {
+        
+        warning(
+          "cv_spatial failed for block size ",
+          bs,
+          ": ",
+          conditionMessage(e)
+        )
+        
+        NULL
+      }
+    )
+    
+    if (
+      is.null(cv_obj) ||
+      is.null(cv_obj$folds_list) ||
+      length(cv_obj$folds_list) == 0
+    ) {
+      next
+    }
+    
+    fold_metrics <- list()
+    
+  
+    # Fold loop
+    
+    for (fold_id in seq_along(cv_obj$folds_list)) {
+      
+      this_fold <- cv_obj$folds_list[[fold_id]]
+      
+      if (length(this_fold) < 2)
+        next
+      
+      train_ids <-
+        if (is.numeric(this_fold[[1]])) {
+          as.integer(this_fold[[1]])
+        } else {
+          this_fold[[1]]$.row_id
+        }
+      
+      test_ids <-
+        if (is.numeric(this_fold[[2]])) {
+          as.integer(this_fold[[2]])
+        } else {
+          this_fold[[2]]$.row_id
+        }
+      
+      train_ids <- train_ids[
+        train_ids >= 1 &
+          train_ids <= nrow(cv_dat)
+      ]
+      
+      test_ids <- test_ids[
+        test_ids >= 1 &
+          test_ids <= nrow(cv_dat)
+      ]
+      
+      if (
+        length(train_ids) == 0 ||
+        length(test_ids) == 0
+      ) {
+        next
+      }
+      
+      train_dat <- cv_dat[
+        train_ids,
+        ,
+        drop = FALSE
+      ]
+      
+      test_dat <- cv_dat[
+        test_ids,
+        ,
+        drop = FALSE
+      ]
+      
+      if (
+        length(unique(train_dat$presence)) < 2 ||
+        length(unique(test_dat$presence)) < 2
+      ) {
+        next
+      }
+      
+      # Hyperparameter tuning
+      
+      for (mtry in cfg$rf_grid_mtry) {
+        
+        for (mn in cfg$rf_grid_min_node) {
+          
+          for (sf in cfg$rf_grid_sample_frac) {
+            
+            fit <- ranger::ranger(
+              presence ~ .,
+              data = transform(
+                train_dat,
+                presence = factor(
+                  presence,
+                  levels = c(0, 1)
+                )
+              ),
+              probability = TRUE,
+              num.trees = 500,
+              mtry = min(
+                mtry,
+                length(final_predictors)
+              ),
+              min.node.size = mn,
+              sample.fraction = sf,
+              importance = "permutation",
+              respect.unordered.factors = "order",
+              classification = TRUE
+            )
+            
+            p_test <- get_ranger_prob(
+              fit,
+              transform(
+                test_dat,
+                presence = factor(
+                  presence,
+                  levels = c(0, 1)
+                )
+              )
+            )
+            
+            auc_val <- calc_auc(
+              test_dat$presence,
+              p_test
+            )
+            
+            thr <- calc_optimal_threshold(
+              truth = test_dat$presence,
+              prob = p_test,
+              method = "youden"
+            )
+            
+            met <- calc_binary_metrics(
+              obs = test_dat$presence,
+              prob = p_test,
+              thr = thr
+            )
+            
+            fold_metrics[[length(fold_metrics) + 1L]] <- data.frame(
+              block_size = bs,
+              fold = fold_id,
+              mtry = mtry,
+              min_node = mn,
+              sample_fraction = sf,
+              AUC = auc_val,
+              threshold = thr,
+              sensitivity = met$sensitivity,
+              specificity = met$specificity,
+              TSS = met$TSS,
+              accuracy = met$accuracy
+            )
+          }
+        }
+      }
+    }
+    
+    if (length(fold_metrics) == 0)
+      next
+    
+    cv_df <- dplyr::bind_rows(fold_metrics)
+    
+    cv_results[[as.character(bs)]] <- cv_df
+    
+    block_checks_df[
+      block_checks_df$block_size == bs,
+      "AUC_mean"
+    ] <- mean(
+      cv_df$AUC,
+      na.rm = TRUE
+    )
+    
+    block_checks_df[
+      block_checks_df$block_size == bs,
+      "TSS_mean"
+    ] <- mean(
+      cv_df$TSS,
+      na.rm = TRUE
+    )
+  }
+  
+  # Select best block size
+  
+  valid <- which(
+    !is.na(block_checks_df$TSS_mean)
+  )
+  
+  if (length(valid) > 0) {
+    
+    ord <- order(
+      block_checks_df$TSS_mean[valid],
+      block_checks_df$AUC_mean[valid],
+      decreasing = TRUE
+    )
+    
+    best_block_size <-
+      block_checks_df$block_size[valid][ord][1]
+  }
+  
+  message(
+    "Selected best_block_size: ",
+    best_block_size,
+    " m"
+  )
+  
+  if (is.na(best_block_size)) {
+    best_block_size <- cfg$block_size_m
+  }
+  
+  glo_cv_results <- cv_results
+  glo_block_checks_df <- block_checks_df
+  glo_best_block_size <- best_block_size
+  
+  #############################################################################
+  # 4.8 Final global RF fit
+  #############################################################################
+  
+  glo_final_dat <- glo_full_data_model[, c("presence", final_predictors), drop = FALSE]
+  glo_final_dat$presence <- as.factor(glo_final_dat$presence)
+  
+  glo_final_model <- ranger::ranger(
+    presence ~ .,
+    data = glo_final_dat,
+    probability = TRUE,
+    num.trees = 1000,
+    mtry = min(3, length(final_predictors)),
+    min.node.size = 1,
+    sample.fraction = 0.632,
+    importance = "permutation",
+    respect.unordered.factors = "order",
+    classification = TRUE
+  )
+  
+  glo_train_prob <- get_ranger_prob(glo_final_model, glo_final_dat)
+  glo_auc_train <- calc_auc(glo_final_dat$presence, glo_train_prob)
+  glo_optimal_threshold <- calc_optimal_threshold(glo_final_dat$presence, glo_train_prob)
+  glo_training_metrics <- calc_binary_metrics(glo_final_dat$presence, glo_train_prob, glo_optimal_threshold)
+  glo_training_metrics$AUC <- glo_auc_train
+  
+  #############################################################################
+  # 4.9 Predict global suitability
+  #############################################################################
+  
+  glo_pred_for_model <- glo_pred_stack[[final_predictors]]
+  
+  global_suit <- terra::predict(
+    glo_pred_for_model,
+    glo_final_model,
+    type = "response",
+    index = 2,
+    na.rm = TRUE,
+    filename = file.path(ras_dir, "global_suitability.tif"),
+    overwrite = TRUE,
+    wopt = list(datatype = "FLT4S", gdal = c("COMPRESS=NONE"))# or: gdal = c("COMPRESS=LZW"), LZW reduces file size substantially
+  )
+  
+  names(global_suit) <- "suitability"
+  
+  if (file.exists(cfg$boundary_file)) {
+    study_bnd <- sf::st_read(cfg$boundary_file, quiet = TRUE)
+    study_bnd <- sf::st_make_valid(study_bnd)
+    if (!is.na(sf::st_crs(study_bnd))) {
+      study_bnd <- sf::st_transform(study_bnd, terra::crs(global_suit))
+      study_vect <- terra::vect(study_bnd)
+      glo_maskreg_suit <- terra::mask(terra::crop(global_suit, study_vect), study_vect)
+      terra::writeRaster(
+        glo_maskreg_suit,
+        file.path(ras_dir, "study_area_suitability.tif"),
+        overwrite = TRUE
+      )
+    }
+  }
+  
+  #############################################################################
+  # 4.10 Save global SDM objects
+  #############################################################################
+  
+  saveRDS(glo_final_model, file.path(tables_dir, "global_rf_model.rds"))
+  saveRDS(glo_training_metrics, file.path(tables_dir, "global_training_metrics.rds"))
+  saveRDS(final_predictors, file.path(tables_dir, "global_selected_predictors.rds"))
+  saveRDS(glo_optimal_threshold, file.path(tables_dir, "global_optimal_threshold.rds"))
+  
+  glo_cv_summary_all <- bind_rows(lapply(names(glo_cv_results), function(nm) {
+    x <- glo_cv_results[[nm]]
+    if (is.null(x) || nrow(x) == 0) return(NULL)
+    x %>%
+      summarise(
+        block_size = as.numeric(nm),
+        AUC_mean = mean(AUC, na.rm = TRUE),
+        AUC_sd = sd(AUC, na.rm = TRUE),
+        TSS_mean = mean(TSS, na.rm = TRUE),
+        TSS_sd = sd(TSS, na.rm = TRUE)
+      )
+  }))
+  
+  saveRDS(glo_cv_results, file.path(tables_dir, "global_cv_results.rds"))
+  saveRDS(glo_cv_summary_all, file.path(tables_dir, "global_cv_summary.rds"))
+  
+  message("Global SDM completed.")
+}
+
+#############################################################################
+# 5. LOCAL NESTED SDM MODULE
+#############################################################################
+
+if (isTRUE(cfg$run_local_sdm)) {
+  
+  message("Running local nested SDM module...")
+  
+  set.seed(cfg$seed_local)
+  
+  #############################################################################
+  # 5.1 Read occurrence data and clip to target region
+  #############################################################################
+  
+# reg_ prefix stands for "regional"  
+  
+  message("Reading occurrence data...")
+  
+  reg_occ_file <- cfg$occurrence_file_regional
+  
+  # a) Try TSV first (your file appears tab-delimited)
+  reg_occ_raw <- tryCatch(
+    readr::read_tsv(reg_occ_file, show_col_types = FALSE, progress = FALSE),
+    error = function(e) NULL
+  )
+  
+  # b) Fallback CSV
+  if (is.null(reg_occ_raw) || ncol(reg_occ_raw) < 5) {
+    reg_occ_raw <- tryCatch(
+      readr::read_csv(reg_occ_file, show_col_types = FALSE, progress = FALSE),
+      error = function(e) NULL
+    )
+  }
+  
+  # c) Fallback base with no quote handling if still broken
+  if (is.null(reg_occ_raw) || ncol(reg_occ_raw) < 5) {
+    reg_occ_raw <- read.table(
+      reg_occ_file,
+      header = TRUE,
+      sep = "\t",
+      quote = "",
+      fill = TRUE,
+      comment.char = "",
+      stringsAsFactors = FALSE,
+      check.names = FALSE
+    )
+  }
+  
+  if (is.null(reg_occ_raw) || nrow(reg_occ_raw) == 0) {
+    stop("Could not read occurrence file or file has zero rows.")
+  }
+  
+  # keep original + cleaned names
+  reg_occ <- as.data.frame(reg_occ_raw)
+  nm_orig <- names(reg_occ)
+  nm_clean <- janitor::make_clean_names(nm_orig)
+  
+  # original -> clean
+  names(reg_occ) <- nm_clean
+  
+  # Required columns after cleaning
+  # countryCode -> country_code
+  # decimalLatitude -> decimal_latitude
+  # decimalLongitude -> decimal_longitude
+  need <- c("country_code", "decimal_latitude", "decimal_longitude")
+  miss <- setdiff(need, names(reg_occ))
+  if (length(miss) > 0) {
+    stop("Missing required columns after cleaning: ", paste(miss, collapse = ", "))
+  }
+  
+  reg_occ <- reg_occ %>%
+    dplyr::mutate(
+      country_code = toupper(trimws(as.character(country_code))),
+      lon = suppressWarnings(as.numeric(decimal_longitude)),
+      lat = suppressWarnings(as.numeric(decimal_latitude))
+    ) %>%
+    dplyr::filter(
+      country_code == "CH",
+      is.finite(lon), is.finite(lat),
+      lon >= -180, lon <= 180,
+      lat >= -90,  lat <= 90
+    ) %>%
+    dplyr::distinct(lon, lat, .keep_all = TRUE)
+  
+  if (nrow(reg_occ) == 0) stop("No valid occurrence point within target country after cleaning.")
+  
+  # Build pres_sf
+  reg_pres_sf <- sf::st_as_sf(reg_occ, coords = c("lon", "lat"), crs = 4326, remove = FALSE)
+  reg_pres_sf$presence <- 1L
+  
+  # Clip to study area
+  study_sf <- sf::st_as_sf(study_vect)
+  reg_pres_sf <- sf::st_transform(reg_pres_sf, sf::st_crs(study_sf))
+  reg_pres_sf <- reg_pres_sf[lengths(sf::st_intersects(reg_pres_sf, study_sf)) > 0, , drop = FALSE]
+  
+  if (nrow(reg_pres_sf) == 0) {
+    stop("Occurrence points found, but none intersect study area. Check study_vect CRS/extent.")
+  }
+  
+  cat("Presences retained (target country + inside study area):", nrow(reg_pres_sf), "\n")
+  
+  
+  ###############################################################################
+  # 5.2 Build regional predictors (regional extent/mask, aligned geometry)
+  ###############################################################################
+  
+  # glo_maskreg_suit is expected from previous section (global)
+  # otherwise import study_area_suitability.tif from path stored in cfg$coarse_suit_file
+  
+  coarse_suit_r <- glo_maskreg_suit
+  names(coarse_suit_r) <- "coarse_suitability"
+  
+  #landuse for target country / study region to be imported
+  landuse_file <- cfg$regional_landuse_file
+  landuse <- terra::rast(landuse_file)
+  
+  # Check crs and ensure landuse aligns to coarse suitability geometry
+
+  if (terra::crs(landuse) != terra::crs(cfg$regional_target_crs)) {
+    landuse <- terra::project(landuse, cfg$regional_target_crs, method = "near")
+  }
+  
+  if (terra::crs(coarse_suit_r) != terra::crs(cfg$regional_target_crs)) {
+    coarse_suit_r <- terra::project(coarse_suit_r, cfg$regional_target_crs, method = "bilinear")
+  }
+  
+  if (!terra::compareGeom(landuse, coarse_suit_r, stopOnError = FALSE)) {
+    coarse_suit_r <- terra::resample(coarse_suit_r, landuse, method = "bilinear")
+  }
+    
+  # Build one-hot land-use dummies from observed classes
+  landuse_vals <- terra::values(landuse, mat = FALSE)
+  
+  lu_ids <- sort(unique(stats::na.omit(as.integer(landuse_vals))))
+  if (length(lu_ids) == 0) stop("No valid land-use classes found in landuse raster.")
+  lu_ids <- setdiff(lu_ids, 0)
+  
+  lu_dummy_list <- lapply(lu_ids, function(id) {
+    terra::ifel(landuse == id, 1, 0)
+  })
+  
+  lu_dummy <- terra::rast(lu_dummy_list)
+  names(lu_dummy) <- paste0("lu_", lu_ids)
+  
+  # Regional predictor stack
+  reg_pred_stack <- c(coarse_suit_r, lu_dummy)
+  reg_predictors <- names(reg_pred_stack)
+  
+  # Restrict to study region ( mask with study_vect)
+  if (terra::crs(study_vect) != terra::crs(cfg$regional_target_crs)) {
+    study_vect_proj <- terra::project(study_vect, cfg$regional_target_crs)
+  }
+
+  reg_pred_stack <- terra::crop(reg_pred_stack, study_vect_proj, snap = "out")
+  reg_pred_stack <- terra::mask(reg_pred_stack, study_vect_proj)
+  
+  ###############################################################################
+  # 5.2 Presence + background sampling + predictor extraction
+  ###############################################################################
+  
+  # Preconditions
+  if (!inherits(reg_pres_sf, "sf")) stop("pres_sf must be an sf object.")
+  if (!inherits(study_vect_proj, "SpatVector")) stop("study_vect must be a terra SpatVector.")
+  if (!inherits(reg_pred_stack, "SpatRaster")) stop("regional_pred_stack must be a terra SpatRaster.")
+  
+  # Presence label
+  if (!"presence" %in% names(reg_pres_sf)) reg_pres_sf$presence <- 1L
+  reg_pres_sf$presence <- 1L
+  
+  # IMPORTANT: fail early if empty upstream
+  if (nrow(reg_pres_sf) == 0) {
+    stop("pres_sf is empty before local assembly. Fix upstream occurrence filtering/creation.")
+  }
+  
+  # CRS checks
+  if (is.na(sf::st_crs(reg_pres_sf))) stop("pres_sf has no CRS.")
+  if (is.na(terra::crs(study_vect_proj))) stop("study_vect has no CRS.")
+  if (is.na(terra::crs(reg_pred_stack))) stop("regional_pred_stack has no CRS.")
+  
+  # Harmonize CRS 
+  if (terra::crs(reg_pres_sf) != terra::crs(cfg$regional_target_crs)) {
+    reg_pres_sf <- sf::st_transform(reg_pres_sf, cfg$regional_target_crs)
+  }
+  
+  if (terra::crs(study_vect_proj) != terra::crs(cfg$regional_target_crs)) {
+    study_vect_proj <- terra::project(study_vect_proj, cfg$regional_target_crs)
+  }
+  
+  if (terra::crs(reg_pred_stack) != terra::crs(cfg$regional_target_crs)) {
+    reg_pred_stack <- terra::project(reg_pred_stack, cfg$regional_target_crs)
+  }
+
+  study_sf <- sf::st_as_sf(study_vect_proj)
+  inside_idx <- lengths(sf::st_intersects(reg_pres_sf, study_sf)) > 0
+  reg_pres_sf <- reg_pres_sf[inside_idx, , drop = FALSE]
+  if (nrow(reg_pres_sf) == 0) stop("No presence points inside study area after CRS transform/intersection.")
+  
+  # Remove duplicate coordinates
+  reg_pres_xy <- sf::st_coordinates(reg_pres_sf)
+  dup <- duplicated(data.frame(x = reg_pres_xy[,1], y = reg_pres_xy[,2]))
+  reg_pres_sf <- reg_pres_sf[!dup, , drop = FALSE]
+  if (nrow(reg_pres_sf) == 0) stop("No unique presence points remain after duplicate removal.")
+  
+  n_row_reg_final_pres <- nrow(reg_pres_sf)
+  n_pres <- nrow(reg_pres_sf)
+  message("Presence count (inside study area, unique): ", n_pres)
+  
+  # Valid mask = cells with all predictors non-NA, within study area
+  valid_mask <- !is.na(reg_pred_stack[[1]])
+  if (terra::nlyr(reg_pred_stack) > 1) {
+    for (i in 2:terra::nlyr(reg_pred_stack)) {
+      valid_mask <- valid_mask & !is.na(reg_pred_stack[[i]])
+    }
+  }
+  
+  valid_mask <- terra::ifel(valid_mask, 1, 0)
+  valid_mask <- terra::mask(valid_mask, study_vect_proj)
+  
+  
+  # Optional exclusion buffer around presences
+  reg_pres_v <- terra::vect(reg_pres_sf)
+  if (!is.null(cfg$regional_bg_buffer_m) &&
+      length(cfg$regional_bg_buffer_m) > 0 &&
+      is.finite(cfg$regional_bg_buffer_m[1]) &&
+      cfg$regional_bg_buffer_m[1] > 0) {
+    reg_pres_buffer <- terra::buffer(reg_pres_v, width = cfg$regional_bg_buffer_m[1])
+    valid_mask  <- terra::mask(valid_mask, reg_pres_buffer, inverse = TRUE)
+  }
+  
+  reg_eligible_cells <- terra::global(valid_mask, "sum", na.rm = TRUE)[1,1]
+  if (is.na(reg_eligible_cells) || reg_eligible_cells < n_pres) {
+    stop(sprintf("Not enough eligible background cells (%s) for n_pres=%s.", reg_eligible_cells, n_pres))
+  }
+  
+  # Sample background: 1:1 with presence
+  reg_bg_pts <- terra::spatSample(
+    x = valid_mask, size = n_pres, method = "random",
+    na.rm = TRUE, as.points = TRUE, values = FALSE
+  )
+  if (is.null(reg_bg_pts) || terra::nrow(reg_bg_pts) != n_pres) {
+    stop(sprintf("Background sampling failed or returned wrong count (%s vs %s).",
+                 ifelse(is.null(bg_pts), 0, terra::nrow(bg_pts)), n_pres))
+  }
+  
+  reg_bg_sf <- sf::st_as_sf(reg_bg_pts)
+  if (is.na(sf::st_crs(reg_bg_sf))) stop("bg_sf has no CRS.")
+  if (sf::st_crs(reg_bg_sf)$wkt != sf::st_crs(reg_pres_sf)$wkt) {
+    reg_bg_sf <- sf::st_transform(reg_bg_sf, sf::st_crs(pres_sf))
+  }
+  reg_bg_sf$presence <- 0L
+  
+  # Predictor extraction
+  reg_pres_ext <- terra::extract(reg_pred_stack, terra::vect(reg_pres_sf))
+  reg_bg_ext   <- terra::extract(reg_pred_stack, terra::vect(reg_bg_sf))
+  reg_pres_ext <- as.data.frame(reg_pres_ext)[, -1, drop = FALSE]  # drop ID
+  reg_bg_ext   <- as.data.frame(reg_bg_ext)[, -1, drop = FALSE]
+  
+  reg_pres_df <- cbind(data.frame(presence = 1L), reg_pres_ext)
+  reg_bg_df   <- cbind(data.frame(presence = 0L), reg_bg_ext)
+  reg_full_data_model <- dplyr::bind_rows(reg_pres_df, reg_bg_df)
+  
+  needed_cols <- c("presence", reg_predictors)
+  missing_cols <- setdiff(needed_cols, names(reg_full_data_model))
+  if (length(missing_cols) > 0) {
+    stop("Missing columns after extraction: ", paste(missing_cols, collapse = ", "))
+  }
+  reg_full_data_model <- reg_full_data_model[, needed_cols, drop = FALSE]
+  
+  message("\nClass balance BEFORE complete.cases:")
+  print(table(reg_full_data_model$presence, useNA = "ifany"))
+  
+  reg_full_data_model <- reg_full_data_model[stats::complete.cases(reg_full_data_model), , drop = FALSE]
+  
+  tab_local <- table(reg_full_data_model$presence)
+  message("\nClass balance AFTER complete.cases:")
+  print(tab_local)
+  
+  if (length(tab_local) < 2 || any(tab_local == 0)) {
+    stop("Local assembly failed: single class after extraction/cleaning.")
+  }
+  if (nrow(reg_full_data_model) < 20) {
+    stop("Too few local modeling records after extraction.")
+  }
+  
+  # Strict re-balance after NA filtering
+  if (!all(c("0","1") %in% names(tab_local)) || tab_local["0"] != tab_local["1"]) {
+    n_min <- min(tab_local)
+    set.seed(if (!is.null(cfg$seed)) cfg$seed else 42)
+    i1 <- which(reg_full_data_model$presence == 1L)
+    i0 <- which(reg_full_data_model$presence == 0L)
+    keep <- c(sample(i1, n_min), sample(i0, n_min))
+    reg_full_data_model <- reg_full_data_model[keep, , drop = FALSE]
+    message(sprintf("Rebalanced to 1:1 with n=%s per class.", n_min))
+    print(table(reg_full_data_model$presence))
+  }
+  
+  ###############################################################################
+  # 5.3 Regional spatial CV and tuning
+  ###############################################################################
+  
+  set.seed(cfg$seed_local)
+  
+  # Build CV point object from pres/bg used above
+  cv_pts <- rbind(
+    sf::st_as_sf(data.frame(presence = 1L), geometry = sf::st_geometry(reg_pres_sf)),
+    sf::st_as_sf(data.frame(presence = 0L), geometry = sf::st_geometry(reg_bg_sf))
+  )
+  sf::st_crs(cv_pts) <- sf::st_crs(reg_pres_sf)
+  
+  # Extract predictors for exact row sync
+  cv_ext <- terra::extract(reg_pred_stack, terra::vect(cv_pts))
+  cv_ext <- as.data.frame(cv_ext)[, -1, drop = FALSE]
+  cv_dat <- cbind(sf::st_drop_geometry(cv_pts), cv_ext)
+  cv_dat <- cv_dat[, c("presence", reg_predictors), drop = FALSE]
+  
+  cc_cv <- stats::complete.cases(cv_dat)
+  cv_dat <- cv_dat[cc_cv, , drop = FALSE]
+  cv_pts <- cv_pts[cc_cv, , drop = FALSE]
+  cv_pts$.row_id <- seq_len(nrow(cv_pts))
+  cv_pts$presence <- cv_dat$presence
+  
+  cv_results <- list()
+  
+  block_checks_df <- data.frame(
+    block_size = cfg$regional_block_sizes_m,
+    AUC_mean   = NA_real_,
+    TSS_mean   = NA_real_
+  )
+  
+  best_block <- cfg$regional_block_size_m
+  
+  for (bs in cfg$regional_block_sizes_m) {
+    message("Checking local block size: ", bs, " m")
+    
+    cv_obj <- tryCatch(
+      blockCV::cv_spatial(
+        x = cv_pts, column = "presence", k = 5, size = bs,
+        selection = "random", iteration = 100, hexagon = FALSE,
+        plot = FALSE, progress = FALSE
+      ),
+      error = function(e) {
+        warning("cv_spatial failed for block size ", bs, ": ", conditionMessage(e))
+        NULL
+      }
+    )
+    if (is.null(cv_obj) || is.null(cv_obj$folds_list) || length(cv_obj$folds_list) == 0) next
+    
+    fold_tbl <- list()
+    for (fold_id in seq_along(cv_obj$folds_list)) {
+      this_fold <- cv_obj$folds_list[[fold_id]]
+      if (length(this_fold) < 2) next
+      
+      train_ids <- if (is.numeric(this_fold[[1]])) as.integer(this_fold[[1]]) else this_fold[[1]]$.row_id
+      test_ids  <- if (is.numeric(this_fold[[2]])) as.integer(this_fold[[2]]) else this_fold[[2]]$.row_id
+      
+      train_ids <- train_ids[train_ids >= 1 & train_ids <= nrow(cv_dat)]
+      test_ids  <- test_ids[test_ids >= 1 & test_ids <= nrow(cv_dat)]
+      if (length(train_ids) == 0 || length(test_ids) == 0) next
+      
+      train_dat <- cv_dat[train_ids, , drop = FALSE]
+      test_dat  <- cv_dat[test_ids, , drop = FALSE]
+      
+      if (length(unique(train_dat$presence)) < 2 || length(unique(test_dat$presence)) < 2) next
+      
+      fit <- ranger::ranger(
+        presence ~ .,
+        data = transform(train_dat, presence = factor(presence, levels = c(0,1))),
+        probability = TRUE,
+        num.trees = 500,
+        mtry = min(3, length(reg_predictors)),
+        min.node.size = 1,
+        sample.fraction = 0.632,
+        importance = "permutation",
+        classification = TRUE
+      )
+      
+      p_test <- get_ranger_prob(fit, transform(test_dat, presence = factor(presence, levels = c(0,1))))
+      thr <- calc_optimal_threshold(test_dat$presence, p_test)
+      met <- calc_binary_metrics(test_dat$presence, p_test, thr)
+      
+      fold_tbl[[length(fold_tbl) + 1L]] <- data.frame(
+        block_size = bs, fold = fold_id,
+        AUC = calc_auc(test_dat$presence, p_test),
+        threshold = thr,
+        sensitivity = met$sensitivity,
+        specificity = met$specificity,
+        TSS = met$TSS,
+        accuracy = met$accuracy
+      )
+    }
+    
+    if (length(fold_tbl) == 0) next
+    cv_df <- dplyr::bind_rows(fold_tbl)
+    cv_results[[as.character(bs)]] <- cv_df
+    block_checks_df[block_checks_df$block_size == bs, "AUC_mean"] <- mean(cv_df$AUC, na.rm = TRUE)
+    block_checks_df[block_checks_df$block_size == bs, "TSS_mean"] <- mean(cv_df$TSS, na.rm = TRUE)
+  }
+  
+  valid <- which(!is.na(block_checks_df$TSS_mean))
+  if (length(valid) > 0) {
+    ord <- order(block_checks_df$TSS_mean[valid], block_checks_df$AUC_mean[valid], decreasing = TRUE)
+    best_block_size <- block_checks_df$block_size[valid][ord][1]
+  }
+  message("Selected regional_best_block: ", best_block_size, "m")
+  
+  if (is.na(best_block_size)) {
+    best_block_size <- cfg$regional_block_size_m
+  }
+  
+  reg_cv_results <- cv_results
+  reg_block_checks_df <- block_checks_df
+  reg_best_block_size <- best_block_size
+  
+  ###############################################################################
+  # 5.4 Fit final regional model
+  ###############################################################################
+  
+  reg_final_dat <- reg_full_data_model[, c("presence", reg_predictors), drop = FALSE]
+  reg_final_dat <- reg_final_dat[stats::complete.cases(reg_final_dat), , drop = FALSE]
+  reg_final_dat <- reg_final_dat[reg_final_dat$presence %in% c(0,1), , drop = FALSE]
+  
+  tab <- table(reg_final_dat$presence)
+  print(tab)
+  if (length(tab) < 2 || any(tab == 0)) stop("Regional model aborted: single-class training data.")
+  
+  reg_final_dat$presence <- factor(reg_final_dat$presence, levels = c(0,1))
+  
+  set.seed(cfg$seed_local)
+  reg_final_model <- ranger::ranger(
+    presence ~ .,
+    data = reg_final_dat,
+    probability = TRUE,
+    num.trees = 500,
+    mtry = min(3, length(reg_predictors)),
+    min.node.size = 1,
+    sample.fraction = 0.632,
+    importance = "permutation",
+    classification = TRUE
+  )
+  
+  reg_train_prob <- get_ranger_prob(reg_final_model, reg_final_dat)
+  reg_auc_train <- calc_auc(reg_final_dat$presence, reg_train_prob)
+  reg_optimal_threshold <- calc_optimal_threshold(reg_final_dat$presence, reg_train_prob)
+  reg_training_metrics <- calc_binary_metrics(reg_final_dat$presence, reg_train_prob, reg_optimal_threshold)
+  reg_training_metrics$AUC <- reg_auc_train
+    
+  ###############################################################################
+  # 5.5 Predict regional suitability
+  ###############################################################################
+  
+  reg_pred_keep <- intersect(reg_predictors, names(reg_pred_stack))
+  if (length(reg_pred_keep) == 0) stop("No predictor layers available for local prediction.")
+  reg_pred_for_model <- reg_pred_stack[[reg_pred_keep]]
+  
+  regional_suit_all <- terra::predict(
+    reg_pred_for_model,
+    reg_final_model,
+    type = "response",
+    na.rm = TRUE,
+    filename = file.path(ras_dir, "regional_probability_allclasses.tif"),
+    overwrite = TRUE,
+    wopt = list(datatype = "FLT4S", gdal = c("COMPRESS=NONE"))# or: gdal = c("COMPRESS=LZW"), LZW reduces file size substantially
+  )
+  
+  nm <- names(regional_suit_all)
+  message("Predicted suitability layer names: ", paste(nm, collapse = ", "))
+  
+  regional_suit_presence <- terra::predict(
+    reg_pred_for_model,
+    reg_final_model,
+    type = "response",
+    index = 2,
+    na.rm = TRUE,
+    filename = file.path(ras_dir, "regional_probability_presence.tif"),
+    overwrite = TRUE,
+    wopt = list(datatype = "FLT4S", gdal = c("COMPRESS=NONE"))# or: gdal = c("COMPRESS=LZW"), LZW reduces file size substantially
+  )  
+  
+  local_pred <- regional_suit_presence
+  names(local_pred) <- "probability"
+  
+  terra::writeRaster(
+    local_pred,
+    filename = file.path(ras_dir, "regional_suitability_presence.tif"),
+    overwrite = TRUE
+  )
+  
+  s <- terra::global(local_pred, c("min","max","mean"), na.rm = TRUE)
+  print(s)
+  if (isTRUE(all.equal(s[1,"min"], s[1,"max"]))) {
+    stop("Degenerate regional suitability raster (min == max).")
+  }
+  
+  local_class <- terra::classify(
+    local_pred,
+    rcl = matrix(
+      c(-Inf, reg_optimal_threshold, 0,
+        reg_optimal_threshold, Inf, 1),
+      ncol = 3, byrow = TRUE
+    ),
+    include.lowest = TRUE,
+    right = FALSE,
+    filename = file.path(ras_dir, "regional_suitability_binary.tif"),
+    overwrite = TRUE
+  )
+  
+  names(local_class) <- "binary_suitability"
+  sb <- terra::global(local_class, c("min","max","mean", "sum"), na.rm = TRUE)
+  message("local_class summary -> min=", sb[1,1], ", max=", sb[1,2], ", mean=", sb[1,3], ", sum=", sb[1,4])
+  
+  
+  ###############################################################################
+  # 5.6 Save regional outputs
+  ###############################################################################
+  
+  saveRDS(reg_final_model, file.path(tables_dir, "regional_rf_model.rds"))
+  saveRDS(reg_training_metrics, file.path(tables_dir, "regional_training_metrics.rds"))
+  saveRDS(reg_predictors, file.path(tables_dir, "regional_selected_predictors.rds"))
+  saveRDS(reg_optimal_threshold,  file.path(tables_dir, "regional_optimal_threshold.rds"))
+  
+  reg_cv_summary_all <- bind_rows(lapply(names(reg_cv_results), function(nm) {
+    x <- reg_cv_results[[nm]]
+    if (is.null(x) || nrow(x) == 0) return(NULL)
+    x %>%
+      summarise(
+        block_size = as.numeric(nm),
+        AUC_mean = mean(AUC, na.rm = TRUE),
+        AUC_sd = sd(AUC, na.rm = TRUE),
+        TSS_mean = mean(TSS, na.rm = TRUE),
+        TSS_sd = sd(TSS, na.rm = TRUE)
+      )
+  }))
+  
+  saveRDS(reg_cv_results, file.path(tables_dir, "regional_cv_results.rds"))
+  saveRDS(reg_cv_summary_all, file.path(tables_dir, "regional_cv_summary.rds"))
+   
+  message("regional SDM completed.")
+
+}
+
+###############################################################################
+###############################################################################
+# 6. HIGH-QUALITY MAP EXPORT
+###############################################################################
+
+if (isTRUE(cfg$run_export)) {
+  
+  message("Exporting high-quality maps...")
+  
+  # ---------------------------------------------------------------------------
+  # 6.0 Helpers
+  # ---------------------------------------------------------------------------
+  `%||%` <- function(a, b) if (!is.null(a)) a else b
+  
+  safe_name <- function(x) {
+    x <- as.character(x %||% "NA")
+    x <- gsub("[^[:alnum:]_\\-]+", "_", x)
+    x <- gsub("_+", "_", x)
+    x <- gsub("^_|_$", "", x)
+    x
+  }
+  
+  dir.create(maps_dir, showWarnings = FALSE, recursive = TRUE)
+  dir.create(tables_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  species_tag <- safe_name(cfg$species_name)
+  area_tag    <- safe_name(cfg$study_area_name)
+  stamp_tag   <- format(Sys.time(), "%Y%m%d_%H%M%S")
+  file_tag    <- paste(species_tag, area_tag, stamp_tag, sep = "_")
+  
+  # ---------------------------------------------------------------------------
+  # 6.1 Select raster
+  # ---------------------------------------------------------------------------
+  if (exists("local_pred")) {
+    habitat_map_rast <- local_pred
+  } else if (exists("regional_suit_presence")) {
+    habitat_map_rast <- regional_suit_presence
+  } else {
+    stop("No prediction raster available for map export.")
+  }
+  
+  if (!inherits(habitat_map_rast, "SpatRaster")) {
+    stop("Selected habitat map is not a terra SpatRaster.")
+  }
+  
+  # enforce single-layer raster
+  if (terra::nlyr(habitat_map_rast) > 1) {
+    message("Prediction raster has multiple layers; using the first layer only.")
+    habitat_map_rast <- habitat_map_rast[[1]]
+  }
+  
+  if (is.null(names(habitat_map_rast)) || names(habitat_map_rast) == "") {
+    names(habitat_map_rast) <- "Suitability"
+  } else {
+    names(habitat_map_rast) <- "Suitability"
+  }
+  
+  # ---------------------------------------------------------------------------
+  # 6.2 Select boundary
+  # ---------------------------------------------------------------------------
+  if (exists("study_bnd")) {
+    study_bnd_plot <- study_bnd
+  } else if (!is.null(cfg$boundary_file) && file.exists(cfg$boundary_file)) {
+    study_bnd_plot <- sf::st_read(cfg$boundary_file, quiet = TRUE)
+  } else {
+    stop("Boundary file not available for map export.")
+  }
+  
+  study_bnd_plot <- sf::st_make_valid(study_bnd_plot)
+  
+  # ---------------------------------------------------------------------------
+  # 6.3 CRS harmonization and masking
+  # ---------------------------------------------------------------------------
+  r_crs <- terra::crs(habitat_map_rast, proj = TRUE)
+  if (is.na(r_crs) || !nzchar(r_crs)) {
+    stop("Prediction raster has missing CRS.")
+  }
+  
+  study_bnd_plot <- sf::st_transform(study_bnd_plot, crs = r_crs)
+  study_vect_plot <- terra::vect(study_bnd_plot)
+  
+  habitat_map_rast <- terra::crop(habitat_map_rast, study_vect_plot)
+  habitat_map_rast <- terra::mask(habitat_map_rast, study_vect_plot)
+  
+  # ---------------------------------------------------------------------------
+  # 6.4 Inspect raster values
+  # ---------------------------------------------------------------------------
+  vals <- terra::values(habitat_map_rast, mat = FALSE)
+  vals_non_na <- vals[!is.na(vals)]
+  
+  if (length(vals_non_na) == 0) {
+    stop("Prediction raster contains no non-NA values after cropping/masking.")
+  }
+  
+  message("Raster summary for export:")
+  message("  n non-NA cells: ", length(vals_non_na))
+  message("  min: ", signif(min(vals_non_na), 5))
+  message("  max: ", signif(max(vals_non_na), 5))
+  
+  uniq_n <- length(unique(round(vals_non_na, 6)))
+  message("  approx. unique values: ", uniq_n)
+  
+  if (uniq_n <= 2) {
+    warning("Raster has very few unique values; map may appear nearly uniform.")
+  }
+  
+  # ---------------------------------------------------------------------------
+  # 6.5 Build plotting dataframe explicitly
+  # ---------------------------------------------------------------------------
+  rr <- terra::as.data.frame(habitat_map_rast, xy = TRUE, na.rm = FALSE)
+  val_col <- setdiff(names(rr), c("x", "y"))[1]
+  names(rr)[names(rr) == val_col] <- "suitability"
+  rr$suitability <- as.numeric(rr$suitability)
+  
+  # optional clipping of weird values
+  rr <- rr %>%
+    dplyr::filter(!is.na(x), !is.na(y))
+  
+  # ---------------------------------------------------------------------------
+  # 6.6 Build map explicitly with numeric fill
+  # ---------------------------------------------------------------------------
+  habitat_map <- ggplot2::ggplot() +
+    ggplot2::geom_raster(
+      data = rr,
+      ggplot2::aes(x = x, y = y, fill = suitability)
+    ) +
+    ggplot2::geom_sf(
+      data = study_bnd_plot,
+      fill = NA,
+      color = "black",
+      linewidth = 0.4
+    ) +
+    ggplot2::scale_fill_viridis_c(
+      option = "C",
+      name = "Suitability",
+      na.value = "transparent"
+    ) +
+    ggplot2::coord_sf(datum = NA) +
+    ggplot2::labs(
+      title = paste0(cfg$species_name, " habitat suitability in ", cfg$study_area_name),
+      subtitle = "High-quality SDM map export",
+      caption = "Generated by the generalized SDM pipeline"
+    ) +
+    ggplot2::theme_minimal(base_size = 11) +
+    ggplot2::theme(
+      legend.position = "right",
+      plot.title = ggplot2::element_text(face = "bold"),
+      axis.title = ggplot2::element_blank(),
+      panel.grid = ggplot2::element_blank()
+    )
+  
+  # ---------------------------------------------------------------------------
+  # 6.7 Output paths
+  # ---------------------------------------------------------------------------
+  png_map_file <- file.path(maps_dir, paste0(file_tag, "_habitat_suitability.png"))
+  tif_map_file <- file.path(maps_dir, paste0(file_tag, "_habitat_suitability.tif"))
+  pdf_map_file <- file.path(maps_dir, paste0(file_tag, "_habitat_suitability.pdf"))
+  map_rds_file <- file.path(maps_dir, paste0(file_tag, "_habitat_suitability_plot.rds"))
+  
+  # ---------------------------------------------------------------------------
+  # 6.8 Save PNG
+  # ---------------------------------------------------------------------------
+  if (requireNamespace("ragg", quietly = TRUE)) {
+    ggplot2::ggsave(
+      filename = png_map_file,
+      plot = habitat_map,
+      device = ragg::agg_png,
+      width = cfg$map_width %||% 10,
+      height = cfg$map_height %||% 8,
+      units = "in",
+      dpi = cfg$map_dpi %||% 600,
+      background = "white"
+    )
+  } else {
+    ggplot2::ggsave(
+      filename = png_map_file,
+      plot = habitat_map,
+      device = "png",
+      width = cfg$map_width %||% 10,
+      height = cfg$map_height %||% 8,
+      units = "in",
+      dpi = cfg$map_dpi %||% 600,
+      bg = "white"
+    )
+  }
+  
+  # ---------------------------------------------------------------------------
+  # 6.9 Save TIFF
+  # ---------------------------------------------------------------------------
+  ggplot2::ggsave(
+    filename = tif_map_file,
+    plot = habitat_map,
+    device = "tiff",
+    width = cfg$map_width %||% 10,
+    height = cfg$map_height %||% 8,
+    units = "in",
+    dpi = cfg$map_dpi %||% 600,
+    compression = "lzw",
+    bg = "white"
+  )
+  
+  # ---------------------------------------------------------------------------
+  # 6.10 Save PDF
+  # ---------------------------------------------------------------------------
+  if (capabilities("cairo")) {
+    ggplot2::ggsave(
+      filename = pdf_map_file,
+      plot = habitat_map,
+      device = grDevices::cairo_pdf,
+      width = cfg$map_width %||% 10,
+      height = cfg$map_height %||% 8,
+      units = "in",
+      bg = "white"
+    )
+  } else {
+    ggplot2::ggsave(
+      filename = pdf_map_file,
+      plot = habitat_map,
+      device = grDevices::pdf,
+      width = cfg$map_width %||% 10,
+      height = cfg$map_height %||% 8,
+      units = "in",
+      bg = "white",
+      useDingbats = FALSE
+    )
+  }
+  
+  saveRDS(habitat_map, file = map_rds_file)
+  
+  message("High-quality maps saved successfully:")
+  message("PNG: ", normalizePath(png_map_file, winslash = "/", mustWork = FALSE))
+  message("TIFF: ", normalizePath(tif_map_file, winslash = "/", mustWork = FALSE))
+  message("PDF: ", normalizePath(pdf_map_file, winslash = "/", mustWork = FALSE))
+  message("RDS: ", normalizePath(map_rds_file, winslash = "/", mustWork = FALSE))
+}
+
+###############################################################################
+# 7. EXCEL EXPORT 
+###############################################################################
+
+if (isTRUE(cfg$run_export)) {
+  
+  message("Exporting results to Excel workbook...")
+  
+  if (!requireNamespace("openxlsx", quietly = TRUE)) {
+    stop("Package 'openxlsx' is required for Excel export.")
+  }
+  
+  `%||%` <- function(a, b) if (!is.null(a)) a else b
+  
+  # ---------- robust helpers ----------
+  safe_metric <- function(df_name, col_name) {
+    if (!exists(df_name, inherits = TRUE)) return(NA_real_)
+    x <- get(df_name, inherits = TRUE)
+    if (!is.data.frame(x) || !(col_name %in% names(x)) || nrow(x) == 0) return(NA_real_)
+    suppressWarnings(as.numeric(x[[col_name]][1]))
+  }
+  
+  prepare_for_excel_safe <- function(x) {
+    # fallback if your prepare_for_excel is absent or fails
+    if (!is.data.frame(x)) x <- as.data.frame(x, stringsAsFactors = FALSE)
+    if (ncol(x) == 0) x <- data.frame(note = "empty_table", stringsAsFactors = FALSE)
+    
+    # flatten list-cols safely
+    for (j in seq_len(ncol(x))) {
+      if (is.list(x[[j]])) {
+        x[[j]] <- vapply(
+          x[[j]],
+          function(z) paste(capture.output(str(z, give.attr = FALSE)), collapse = " "),
+          character(1)
+        )
+      }
+    }
+    x
+  }
+  
+  add_df_if_valid <- function(lst, obj_name, sheet_name) {
+    if (!exists(obj_name, inherits = TRUE)) return(lst)
+    obj <- get(obj_name, inherits = TRUE)
+    if (!is.data.frame(obj)) return(lst)
+    if (nrow(obj) == 0 && ncol(obj) == 0) return(lst)
+    lst[[sheet_name]] <- obj
+    lst
+  }
+  
+  get_obj <- function(name, default = NULL) {
+    if (exists(name, inherits = TRUE)) {
+      get(name, inherits = TRUE)
+    } else {
+      default
+    }
+  }
+  
+  build_summary_sheet <- function(prefix) {
+    
+    cv_summary <- get_obj(paste0(prefix, "_cv_summary_all"))
+    
+    cv_auc_mean <- if (!is.null(cv_summary) &&
+                       "AUC_mean" %in% names(cv_summary))
+      mean(cv_summary$AUC_mean, na.rm = TRUE) else NA_real_
+    
+    cv_auc_sd <- if (!is.null(cv_summary) &&
+                     "AUC_mean" %in% names(cv_summary))
+      stats::sd(cv_summary$AUC_mean, na.rm = TRUE) else NA_real_
+    
+    cv_tss_mean <- if (!is.null(cv_summary) &&
+                       "TSS_mean" %in% names(cv_summary))
+      mean(cv_summary$TSS_mean, na.rm = TRUE) else NA_real_
+    
+    cv_tss_sd <- if (!is.null(cv_summary) &&
+                     "TSS_mean" %in% names(cv_summary))
+      stats::sd(cv_summary$TSS_mean, na.rm = TRUE) else NA_real_
+    
+    training_metrics_name <- paste0(prefix, "_training_metrics")
+    
+    if (exists("safe_table_value")) {
+      
+      training_sensitivity <- safe_table_value(training_metrics_name, "sensitivity")
+      training_specificity <- safe_table_value(training_metrics_name, "specificity")
+      training_tss         <- safe_table_value(training_metrics_name, "TSS")
+      training_auc         <- safe_table_value(training_metrics_name, "AUC")
+      
+    } else {
+      
+      training_sensitivity <- safe_metric(training_metrics_name, "sensitivity")
+      training_specificity <- safe_metric(training_metrics_name, "specificity")
+      training_tss         <- safe_metric(training_metrics_name, "TSS")
+      training_auc         <- safe_metric(training_metrics_name, "AUC")
+    }
+    
+    final_threshold <- get_obj(
+      paste0(prefix, "_optimal_threshold"),
+      NA_real_
+    )
+    
+    data.frame(
+      Section = c(
+        rep("Occurrence data", 6),
+        rep("Model configuration", 2),
+        rep("Spatial cross-validation", 4),
+        rep("Apparent training performance", 4),
+        rep("Final classification", 2)
+      ),
+      
+      Metric = c(
+        "Raw occurrences",
+        "Occurrences after cleaning",
+        "Occurrences after thinning",
+        "Final presence records used",
+        "Background points used",
+        "Total records used",
+        "Species name",
+        "Study area name",
+        "Mean AUC across CV blocks",
+        "SD of AUC across CV blocks",
+        "Mean TSS across CV blocks",
+        "SD of TSS across CV blocks",
+        "Training AUC",
+        "Training sensitivity",
+        "Training specificity",
+        "Training TSS",
+        "Final threshold",
+        "Threshold source"
+      ),
+      
+      Value = as.character(c(
+        
+        get_obj(paste0("n_row_", prefix, "_occ"), NA_integer_),
+        
+        get_obj(paste0("n_clean_", prefix, "_occ"), NA_integer_),
+        
+        get_obj(
+          paste0("n_thin_", prefix, "_occ"),
+          get_obj(
+            paste0("n_row_", prefix, "_final_pres"),
+            NA_integer_
+          )
+        ),
+        
+        get_obj(
+          paste0("n_row_", prefix, "_final_pres"),
+          NA_integer_
+        ),
+        
+        if (!is.null(get_obj(paste0(prefix, "_bg_sf"))))
+          nrow(get_obj(paste0(prefix, "_bg_sf")))
+        else NA_integer_,
+        
+        if (!is.null(get_obj(paste0(prefix, "_full_data_model"))))
+          nrow(get_obj(paste0(prefix, "_full_data_model")))
+        else NA_integer_,
+        
+        cfg$species_name %||% NA_character_,
+        cfg$study_area_name %||% NA_character_,
+        
+        round(cv_auc_mean, 4),
+        round(cv_auc_sd, 4),
+        round(cv_tss_mean, 4),
+        round(cv_tss_sd, 4),
+        
+        round(training_auc, 4),
+        round(training_sensitivity, 4),
+        round(training_specificity, 4),
+        round(training_tss, 4),
+        
+        round(final_threshold, 4),
+        
+        if (exists("optimal_threshold"))
+          "Training/appended model threshold"
+        else
+          "Unavailable"
+        
+      )),
+      
+      stringsAsFactors = FALSE
+    )
+  }
+  
+  build_excel_tables <- function(prefix) {
+    
+    excel_tables <- list()
+    
+    excel_tables[[paste0(toupper(prefix), "_Summary")]] <-
+      build_summary_sheet(prefix)
+    
+    sheet_map <- c(
+      full_data_model         = "Training_data",
+      cv_summary_all          = "Spatial_CV_summary",
+      cv_results              = "Spatial_CV_results",
+      training_metrics        = "Training_performance",
+      variable_importance     = "Variable_importance",
+      response_curve_data     = "Response_curves",
+      block_checks_df         = "Block_diagnostics",
+      sensitivity_results_df  = "Sensitivity_results",
+      sensitivity_summary     = "Sensitivity_summary",
+      oof_metrics             = "OOF_performance",
+      all_performance_metrics = "All_performance",
+      overfitting_summary     = "Training_vs_OOF",
+      class_area_summary      = "Suitability_area"
+    )
+    
+    for (suffix in names(sheet_map)) {
+      
+      excel_tables <- add_df_if_valid(
+        excel_tables,
+        paste0(prefix, "_", suffix),
+        paste0(toupper(prefix), "_", sheet_map[[suffix]])
+      )
+    }
+    excel_tables
+  }
+  
+  # ---------- output file ----------
+  species_tag <- gsub("[^[:alnum:]_\\-]+", "_", cfg$species_name %||% "species")
+  area_tag    <- gsub("[^[:alnum:]_\\-]+", "_", cfg$study_area_name %||% "study_area")
+  stamp_tag   <- format(Sys.time(), "%Y%m%d_%H%M%S")
+  
+  dir.create(tables_dir, showWarnings = FALSE, recursive = TRUE)
+  excel_output_file <- file.path(
+    tables_dir,
+    paste0(species_tag, "_", area_tag, "_", stamp_tag, "_all_results.xlsx")
+  )
+  
+  # ---------- collect sheets ----------
+  
+  excel_tables <- c(
+    build_excel_tables("glo"),
+    build_excel_tables("reg")
+  )
+  
+  if (exists("vif_res") &&
+      !is.null(vif_res) &&
+      length(vif_res$excluded) > 0L) {
+    
+    excel_tables[["GLO_VIF_excluded"]] <-
+      data.frame(
+        excluded_predictor = vif_res$excluded,
+        stringsAsFactors = FALSE
+      )
+  }
+  
+  if (exists("local_vif_excluded") &&
+      length(local_vif_excluded) > 0L) {
+    
+    excel_tables[["REG_VIF_excluded"]] <-
+      data.frame(
+        excluded_predictor = local_vif_excluded,
+        stringsAsFactors = FALSE
+      )
+  }
+  
+  # ---------- write workbook ----------
+  wb <- openxlsx::createWorkbook()
+  header_style <- openxlsx::createStyle(
+    textDecoration = "bold", fgFill = "#D9EAF7",
+    halign = "center", valign = "center", border = "Bottom"
+  )
+  
+  for (sheet_name in names(excel_tables)) {
+    sheet_data <- excel_tables[[sheet_name]]
+    
+    # use your function if available; fallback if it crashes
+    if (exists("prepare_for_excel")) {
+      sheet_data <- tryCatch(
+        prepare_for_excel(sheet_data),
+        error = function(e) {
+          message("prepare_for_excel failed for sheet '", sheet_name, "': ", conditionMessage(e),
+                  " -> using safe fallback.")
+          prepare_for_excel_safe(sheet_data)
+        }
+      )
+    } else {
+      sheet_data <- prepare_for_excel_safe(sheet_data)
+    }
+    
+    # final guard
+    if (!is.data.frame(sheet_data) || ncol(sheet_data) == 0) {
+      sheet_data <- data.frame(note = "empty_or_invalid_sheet", stringsAsFactors = FALSE)
+    }
+    
+    sheet_name_use <- substr(sheet_name, 1, 31)
+    openxlsx::addWorksheet(wb, sheet_name_use)
+    openxlsx::writeDataTable(wb, sheet = sheet_name_use, x = sheet_data,
+                             tableStyle = "TableStyleMedium2", withFilter = TRUE)
+    openxlsx::addStyle(wb, sheet = sheet_name_use, style = header_style, rows = 1,
+                       cols = seq_len(ncol(sheet_data)), gridExpand = TRUE, stack = TRUE)
+    openxlsx::freezePane(wb, sheet = sheet_name_use, firstRow = TRUE)
+    openxlsx::setColWidths(wb, sheet = sheet_name_use, cols = seq_len(ncol(sheet_data)), widths = "auto")
+  }
+  
+  openxlsx::saveWorkbook(wb, file = excel_output_file, overwrite = TRUE)
+  message("Excel workbook saved successfully: ",
+          normalizePath(excel_output_file, winslash = "/", mustWork = FALSE))
+}
+
+
+###############################################################################
+# 8. RIRC MODULE
+###############################################################################
+
+
+if (isTRUE(cfg$run_rirc)) {
+  message("Running RIRC module...")
+  
+  # ---------------------------------------------------------------------------
+  # 8.0 Packages + utilities
+  # ---------------------------------------------------------------------------
+  pkgs_needed <- c("terra", "sf", "dplyr", "tidyr", "ggplot2", "tibble")
+  miss <- pkgs_needed[!vapply(pkgs_needed, requireNamespace, logical(1), quietly = TRUE)]
+  if (length(miss) > 0) stop("Missing required package(s): ", paste(miss, collapse = ", "))
+  
+  terra::terraOptions(overwrite = TRUE)
+  
+  `%||%` <- function(a, b) if (!is.null(a)) a else b
+  
+  sanitize_name <- function(x) {
+    x <- gsub("[^[:alnum:]_\\-]+", "_", as.character(x))
+    x <- gsub("_+", "_", x)
+    x <- gsub("^_|_$", "", x)
+    x
+  }
+  
+  # requested title formatter
+  pretty_title <- function(x) {
+    x <- gsub("\\.+", " ", x)
+    x <- gsub("\\s+", " ", x)
+    trimws(x)
+  }
+  
+  # ---------------------------------------------------------------------------
+  # 8.0a File-locking helpers
+  # ---------------------------------------------------------------------------
+  safe_remove_raster <- function(path, tries = 15, wait = 0.3) {
+    targets <- c(path, paste0(path, ".aux.xml"), paste0(path, ".ovr"), paste0(path, ".msk"))
+    targets <- unique(targets[file.exists(targets)])
+    if (length(targets) == 0) return(invisible(TRUE))
+    for (i in seq_len(tries)) {
+      ok_all <- TRUE
+      for (f in targets) {
+        if (file.exists(f)) {
+          ok <- suppressWarnings(try(file.remove(f), silent = TRUE))
+          if (inherits(ok, "try-error") || !isTRUE(ok)) ok_all <- FALSE
+        }
+      }
+      if (ok_all && !any(file.exists(targets))) return(invisible(TRUE))
+      gc()
+      try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+      Sys.sleep(wait)
+    }
+    warning("Could not remove locked raster or sidecar(s): ", path)
+    invisible(FALSE)
+  }
+  
+  safe_rename <- function(from, to, tries = 15, wait = 0.3) {
+    if (!file.exists(from)) stop("Temp file missing, cannot rename: ", from)
+    if (file.exists(to) || file.exists(paste0(to, ".aux.xml")) || file.exists(paste0(to, ".ovr")) || file.exists(paste0(to, ".msk"))) {
+      safe_remove_raster(to, tries = tries, wait = wait)
+    }
+    for (i in seq_len(tries)) {
+      ok <- suppressWarnings(try(file.rename(from, to), silent = TRUE))
+      if (!inherits(ok, "try-error") && isTRUE(ok) && file.exists(to)) return(invisible(TRUE))
+      gc(); Sys.sleep(wait)
+    }
+    ok2 <- suppressWarnings(try(file.copy(from, to, overwrite = TRUE), silent = TRUE))
+    if (!inherits(ok2, "try-error") && isTRUE(ok2) && file.exists(to)) {
+      suppressWarnings(try(file.remove(from), silent = TRUE))
+      return(invisible(TRUE))
+    }
+    stop("Could not move temp file to final destination:\nFROM: ", from, "\nTO: ", to)
+  }
+  
+  # ---------------------------------------------------------------------------
+  # 8.1 RIRC class definitions
+  # ---------------------------------------------------------------------------
+  class_ids <- 0:6
+  class_labels <- c(
+    "No documented impact (DD/NA)",
+    "Very Low", "Low", "Moderate", "High", "Very High", "Extreme"
+  )
+  class_colors <- c(
+    "No documented impact (DD/NA)" = "#BDBDBD",
+    "Very Low"                     = "#B0C4B1",
+    "Low"                          = "#6B8E23",
+    "Moderate"                     = "#FFFF00",
+    "High"                         = "#FFA500",
+    "Very High"                    = "#FF0000",
+    "Extreme"                      = "#8B0000"
+  )
+  
+  # keep separate (for suitability map products only, not RIRC class maps)
+  suitability_class_levels <- c(
+    "Unsuitable habitat (0.0-0.527)",
+    "Marginal suitability (0.527-0.595)",
+    "Moderately suitable (0.595-0.730)",
+    "Highly suitable (0.730-0.865)",
+    "Optimal habitat (0.865-1.0)"
+  )
+  suitability_class_colors <- c(
+    "Unsuitable habitat (0.0-0.527)" = "#F5F5DC",
+    "Marginal suitability (0.527-0.595)" = "#556B2F",
+    "Moderately suitable (0.595-0.730)" = "#B8860B",
+    "Highly suitable (0.730-0.865)" = "#FFA500",
+    "Optimal habitat (0.865-1.0)" = "#FF0000"
+  )
+  
+  category_mapping <- c("DD" = 0, "MC" = 1, "MN" = 2, "MO" = 3, "MR" = 4, "MV" = 5)
+  
+  # ---------------------------------------------------------------------------
+  # 8.2 Land-use impact table
+  # (Example using Sorghum halepense in Switzerland. Update the block below for your target species and location)
+  # ---------------------------------------------------------------------------
+  land_use_data_frame <- data.frame(
+    LU_ID = c(1,2,3,4,5,10,11,12,13,14,15,16,17,111,112,113,114,115,116,117,118,204),
+    LU_category = c(
+      "Industrial areas","Built-up areas","Transportation areas","Special urban areas","Green spaces and recreational areas",
+      "Forests (except brush forests)","Brush forests","Other wood surfaces","Lakes","Rivers & River shores","Unproductive vegetation",
+      "Bare land","Glaciers, snow","Orchards","Vineyards","Horticulture","Arable land","Natural meadows","Farm pastures","Mountain meadows",
+      "Alpine pastures","Built-up agri"
+    ),
+    Management_costs     = c("DD","DD","MN","DD","MN","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","MN","DD","DD","DD","DD","DD"),
+    Toxicity             = c("DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","MR","DD","DD","DD"),
+    Structural_impact    = c("DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","MO","DD","DD","DD","DD","DD","DD","MO","DD","DD","DD","DD"),
+    Disease_transmission = c("DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","MN","DD","DD","DD","DD","DD"),
+    Hybridization        = c("DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD"),
+    Chemical_impact      = c("DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","MO","DD","DD","DD","DD","DD","DD","MO","MO","DD","DD","DD"),
+    Competition          = c("DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","MO","DD","DD","DD","DD","DD","MO","MO","MO","DD","DD","DD"),
+    Human_health         = c("DD","DD","MN","DD","MN","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD","DD"),
+    stringsAsFactors = FALSE
+  )
+  
+  # ---------------------------------------------------------------------------
+  # 8.3 Alignment
+  # ---------------------------------------------------------------------------
+  if (!exists("landuse") && file.exists(cfg$regional_landuse_file)) landuse <- terra::rast(cfg$regional_landuse_file)
+  if (!exists("study_bnd") && file.exists(cfg$boundary_file))    study_bnd <- sf::st_read(cfg$boundary_file, quiet = TRUE)
+  if (!exists("study_vect")) study_vect <- terra::vect(sf::st_make_valid(study_bnd))
+  
+  if (!exists("local_pred") && exists("regional_suit_presence"))  local_pred <- regional_suit_presence
+  if (!exists("local_pred") && exists("glo_maskreg_suit")) local_pred <- glo_maskreg_suit
+  
+  if (!exists("local_pred")) stop("No suitability raster available for RIRC analysis.")
+  if (!exists("landuse"))    stop("Land-use raster not found and cfg$local_landuse_file not readable.")
+  if (!exists("study_bnd"))  stop("Boundary object not found and cfg$boundary_file not readable.")
+  
+  if (is.na(terra::crs(landuse)) || is.na(terra::crs(local_pred))) stop("One or more RIRC raster inputs are missing CRS.")
+  
+  if (terra::crs(landuse) != cfg$regional_target_crs)    landuse <- terra::project(landuse, cfg$regional_target_crs, method = "near")
+  if (terra::crs(local_pred) != cfg$regional_target_crs) local_pred <- terra::project(local_pred, cfg$regional_target_crs, method = "bilinear")
+  if (!terra::compareGeom(landuse, local_pred, stopOnError = FALSE)) local_pred <- terra::resample(local_pred, landuse, method = "bilinear")
+  if (terra::crs(study_vect) != cfg$regional_target_crs)    study_vect <- terra::project(study_vect, cfg$regional_target_crs)
+  
+  landuse    <- terra::mask(terra::crop(landuse, study_vect), study_vect)
+  local_pred <- terra::mask(terra::crop(local_pred, study_vect), study_vect)
+  names(local_pred) <- "Suitability"
+  
+  # discrete suitability for RIRC weighting (1..5)
+  suitability_rirc <- terra::classify(
+    local_pred,
+    rcl = matrix(c(
+      -Inf, 0.527, 1,
+      0.527, 0.595, 2,
+      0.595, 0.730, 3,
+      0.730, 0.865, 4,
+      0.865, Inf,   5
+    ), byrow = TRUE, ncol = 3),
+    include.lowest = TRUE,
+    right = FALSE
+  )
+  names(suitability_rirc) <- "SuitabilityClass"
+  
+  # ---------------------------------------------------------------------------
+  # 8.4 Impact long + classifier
+  # ---------------------------------------------------------------------------
+  impact_long <- land_use_data_frame %>%
+    tidyr::pivot_longer(
+      cols = c(Management_costs, Toxicity, Structural_impact, Disease_transmission,
+               Hybridization, Chemical_impact, Competition, Human_health),
+      names_to = "ImpactType", values_to = "EICAT"
+    ) %>%
+    dplyr::mutate(
+      EICAT = toupper(trimws(EICAT)),
+      ImpactScore = unname(category_mapping[EICAT])
+    )
+  
+  if (any(is.na(impact_long$ImpactScore))) stop("Unknown EICAT codes detected in the impact table.")
+  
+  title_lookup <- c(
+    "Chemical_impact" = "Chemical Impact",
+    "Competition" = "Competition",
+    "Disease_transmission" = "Disease Transmission",
+    "Human_health" = "Human Health",
+    "Management_costs" = "Management Cost",
+    "Structural_impact" = "Structural Impact",
+    "Toxicity" = "Toxicity",
+    "Hybridization" = "Hybridization"
+  )
+  
+  # requested thresholds
+  classify_weighted_original <- function(r) {
+    rcl <- matrix(c(
+      -Inf,      0.000001, 0,
+      0.000001,  2,        1,
+      2,         4,        2,
+      4,         9,        3,
+      9,         12,       4,
+      12,        15,       5,
+      15,        Inf,      6
+    ), byrow = TRUE, ncol = 3)
+    terra::classify(r, rcl = rcl, include.lowest = TRUE, right = FALSE)
+  }
+  
+  save_rirc_map <- function(r_int, title_text, out_png, class_colors, class_labels,
+                            map_width = 10, map_height = 7, map_dpi = 300, show_legend = TRUE) {
+    df <- as.data.frame(terra::as.int(r_int), xy = TRUE, na.rm = FALSE)
+    names(df) <- c("x", "y", "class_val")
+    df <- df[!is.na(df$class_val), , drop = FALSE]
+    key_vals <- 0:(length(class_labels) - 1)
+    df$class_label <- class_labels[match(df$class_val, key_vals)]
+    df$class_label <- factor(df$class_label, levels = class_labels)
+    
+    p <- ggplot2::ggplot(df, ggplot2::aes(x = x, y = y, fill = class_label)) +
+      ggplot2::geom_raster(na.rm = TRUE) +
+      ggplot2::scale_fill_manual(values = class_colors, breaks = class_labels, limits = class_labels, drop = FALSE, na.value = NA) +
+      ggplot2::labs(title = title_text) +
+      ggplot2::coord_equal() +
+      ggplot2::theme_minimal(base_size = 11) +
+      ggplot2::theme(
+        axis.title = ggplot2::element_blank(),
+        panel.grid = ggplot2::element_blank(),
+        plot.title = ggplot2::element_text(face = "bold"),
+        legend.position = if (show_legend) "right" else "none"
+      )
+    
+    ggplot2::ggsave(out_png, p, width = map_width, height = map_height, dpi = map_dpi, bg = "white")
+    invisible(p)
+  }
+  
+  # ---------------------------------------------------------------------------
+  # 8.5 Mechanism-specific maps
+  # ---------------------------------------------------------------------------
+  impact_types <- c(
+    "Management_costs", "Toxicity", "Structural_impact", "Disease_transmission",
+    "Hybridization", "Chemical_impact", "Competition", "Human_health"
+  )
+  
+  rirc_maps_dir    <- file.path(maps_dir,   "RIRC")
+  rirc_rasters_dir <- file.path(ras_dir,    "RIRC")
+  rirc_tables_dir  <- file.path(tables_dir, "RIRC")
+  dir.create(rirc_maps_dir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(rirc_rasters_dir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(rirc_tables_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  for (imp in impact_types) {
+    message("Processing mechanism: ", imp)
+    
+    plot_title <- unname(title_lookup[imp]); if (is.na(plot_title)) plot_title <- pretty_title(imp)
+    imp_clean  <- sanitize_name(imp)
+    imp_folder <- file.path(rirc_maps_dir, imp_clean)
+    dir.create(imp_folder, recursive = TRUE, showWarnings = FALSE)
+    
+    sub <- impact_long %>% dplyr::filter(ImpactType == imp) %>% dplyr::select(LU_ID, ImpactScore)
+    rcl_impact <- as.matrix(sub)
+    
+    impact_file   <- file.path(rirc_rasters_dir, paste0("impact_", imp_clean, ".tif"))
+    weighted_file <- file.path(rirc_rasters_dir, paste0("weighted_", imp_clean, ".tif"))
+    class_file    <- file.path(imp_folder, paste0("RIRC_original_", imp_clean, "_class.tif"))
+    map_png       <- file.path(imp_folder, paste0("MAP_RIRC_original_", imp_clean, ".png"))
+    
+    impact_tmp   <- tempfile(pattern = paste0("impact_", imp_clean, "_"), tmpdir = rirc_rasters_dir, fileext = ".tif")
+    weighted_tmp <- tempfile(pattern = paste0("weighted_", imp_clean, "_"), tmpdir = rirc_rasters_dir, fileext = ".tif")
+    class_tmp    <- tempfile(pattern = paste0("class_", imp_clean, "_"), tmpdir = imp_folder, fileext = ".tif")
+    
+    impact_r <- terra::classify(
+      landuse, rcl = rcl_impact, others = NA,
+      filename = impact_tmp, overwrite = TRUE,
+      wopt = list(datatype = "FLT4S", NAflag = -9999, gdal = c("COMPRESS=LZW"))
+    )
+    
+    # weighted product with strict DD handling
+    weighted_r <- impact_r * suitability_rirc
+    weighted_r <- terra::ifel(impact_r == 0, 0, weighted_r)
+    terra::writeRaster(weighted_r, weighted_tmp, overwrite = TRUE, wopt = list(datatype = "FLT4S", NAflag = -9999, gdal = c("COMPRESS=LZW")))
+    
+    # class + final DD guard
+    rirc_original <- classify_weighted_original(weighted_r)
+    rirc_original <- terra::ifel(impact_r == 0, 0, rirc_original)
+    
+    # diagnostics
+    message("  Impact freq (", imp, "):");   print(as.data.frame(terra::freq(impact_r, digits = 0)))
+    message("  Weighted freq (", imp, "):"); print(as.data.frame(terra::freq(weighted_r, digits = 0)))
+    message("  Class freq (", imp, "):");    print(as.data.frame(terra::freq(rirc_original, digits = 0)))
+    
+    terra::writeRaster(
+      rirc_original, filename = class_tmp, overwrite = TRUE,
+      wopt = list(datatype = "INT1U", NAflag = 255, gdal = c("COMPRESS=LZW"))
+    )
+    
+    rm(impact_r, weighted_r, rirc_original); gc()
+    try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+    
+    safe_rename(impact_tmp, impact_file)
+    safe_rename(weighted_tmp, weighted_file)
+    safe_rename(class_tmp, class_file)
+    
+    r_plot <- terra::rast(class_file)
+    save_rirc_map(
+      r_int = r_plot,
+      title_text = plot_title,
+      out_png = map_png,
+      class_colors = class_colors,
+      class_labels = class_labels,
+      map_width = cfg$map_width %||% 10,
+      map_height = cfg$map_height %||% 7,
+      map_dpi = cfg$map_dpi %||% 300,
+      show_legend = FALSE
+    )
+    
+    rm(r_plot, sub, rcl_impact); gc()
+  }
+  
+  message("RIRC module complete.")
+}
+
+
+###############################################################################
+# 9. FINAL CONSOLE SUMMARY
+###############################################################################
+
+message("Workflow completed successfully.")
+message("Project: ", cfg$project_name)
+message("Species: ", cfg$species_name)
+message("Study area: ", cfg$study_area_name)
+message("Outputs written to: ", out_dir)
+
